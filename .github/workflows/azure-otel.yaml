@@ -28,7 +28,7 @@ jobs:
           az vm list \
           --show-details \
           --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState}" \
-          --output tsv > otel_vms.tsv
+          --output tsv > linux_vms.tsv
         
           if [[ ! -s linux_vms.tsv ]]; then
             echo "No Linux VMs found with OTEL=True tag"
