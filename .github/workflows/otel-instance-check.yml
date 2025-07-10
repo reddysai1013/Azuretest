@@ -1,0 +1,133 @@
+name: EC2 OTEL Agent Check by OTEL Tag
+
+on:
+  #schedule:
+  #  - cron: "0 6 * * *"
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  check-otel-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.SHERPA_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SHERPA_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Get EC2 Instance Info with OTEL=True (Multi-Region)
+        id: get-instance-info
+        run: |
+          echo "Fetching EC2 instances with OTEL=True from multiple US regions..."
+
+          US_REGIONS=("us-east-1" "us-east-2" "us-west-1" "us-west-2")
+          > otel_instances.jsonl  # Clear existing file
+
+          for region in "${US_REGIONS[@]}"; do
+            echo "Checking region: $region"
+
+          aws ec2 describe-instances \
+            --region "$region" \
+            --filters "Name=tag:OTEL,Values=True" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].{InstanceId:InstanceId, PlatformDetails:PlatformDetails}" \
+            --output json | jq -r --arg region "$region" \
+            '.[] | [.InstanceId, (.PlatformDetails // "Linux/UNIX"), $region] | @tsv' >> otel_instances.tsv
+          done
+
+          if [[ ! -s otel_instances.tsv ]]; then
+            echo "No EC2 instances found across U.S. regions with OTEL=True."
+            exit 0
+          fi
+
+      - name: Check OTEL Agent Status per OS
+        env:
+          GITHUB_TOKEN_PAT: ${{ secrets.ILLIA_GITHUB_TOKEN }}
+        run: |
+          echo "Failed Instances:" > failed_instances.log
+          windows_failed=false
+          linux_failed=false
+
+          while IFS=$'\t' read -r INSTANCE_ID PLATFORM_DETAILS REGION; do
+            echo "Checking $INSTANCE_ID with platform: $PLATFORM_DETAILS in region: $REGION"
+
+            if [[ "$PLATFORM_DETAILS" == *"Windows"* ]]; then
+              COMMAND='if ((Get-Service -Name "otelcol").Status -eq "Running") { Write-Output "Service Running" } else { Write-Output "Service Not Running" }'
+              DOCUMENT="AWS-RunPowerShellScript"
+            else
+              COMMAND="systemctl is-active otelcol-agent || true"
+              DOCUMENT="AWS-RunShellScript"
+            fi
+
+            COMMANDS_JSON=$(jq -nc --arg cmd "$COMMAND" '[$cmd]')
+
+            COMMAND_ID=$(aws ssm send-command \
+              --region "$REGION" \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name "$DOCUMENT" \
+              --parameters commands="$COMMANDS_JSON" \
+              --comment "Check OTEL Agent status" \
+              --query "Command.CommandId" \
+              --output text 2>/dev/null) || {
+                echo "Failed to send SSM command to $INSTANCE_ID" | tee -a failed_instances.log
+                echo "-----------------------------------"
+                continue
+              }
+
+            sleep 5
+
+            OUTPUT=$(aws ssm get-command-invocation \
+              --region "$REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query '{Status:Status, Output:StandardOutputContent, Error:StandardErrorContent}' \
+              --output json 2>/dev/null) || {
+                echo "Failed to get command result for $INSTANCE_ID" | tee -a failed_instances.log
+                echo "-----------------------------------"
+                continue
+              }
+
+            echo "Result for $INSTANCE_ID:"
+            echo "$OUTPUT"
+            echo "-----------------------------------"
+
+            STATUS=$(echo "$OUTPUT" | jq -r '.Output' | tr -d '\r\n')
+
+            if [[ "$PLATFORM_DETAILS" == *"Windows"* && "$STATUS" == "Service Not Running" ]]; then
+              echo "$INSTANCE_ID failed Windows check"
+              windows_failed=true
+            elif [[ "$PLATFORM_DETAILS" != *"Windows"* && "$STATUS" != "active" ]]; then
+              echo "$INSTANCE_ID failed Linux check"
+              linux_failed=true
+            fi
+          done < otel_instances.tsv
+
+          if [[ "$windows_failed" == true ]]; then
+            echo "Triggering Windows OTEL workflow..."
+            curl -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN_PAT" \
+              https://api.github.com/repos/Budget-Sherpa/sherpa-observability/actions/workflows/otel-agent-windows.yml/dispatches \
+              -d '{"ref":"main"}'
+          fi
+
+          if [[ "$linux_failed" == true ]]; then
+            echo "Triggering Linux OTEL workflow..."
+            curl -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN_PAT" \
+              https://api.github.com/repos/Budget-Sherpa/sherpa-observability/actions/workflows/otel-agent-linux.yml/dispatches \
+              -d '{"ref":"main"}'
+          fi
+
+          echo ""
+          echo "====== Failed Instances ======"
+          cat failed_instances.log
+          echo "================================"

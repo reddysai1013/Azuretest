@@ -1,0 +1,3 @@
+[submodule "platform/modules-euna"]
+	path = platform/modules-euna
+	url = git@github.com:Euna-Infrastructure/observability-iac.git

@@ -1,0 +1,557 @@
+name: Windows Install/Update and Configure OpenTelemetry Agent via AWS SSM
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"  # Runs at 00:00 UTC on the 1st of every month
+  
+  workflow_dispatch:
+
+jobs:
+  otel-contrib-agent:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ILLIA_GITHUB_TOKEN }}
+
+      - name: Set-up AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.SHERPA_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SHERPA_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      
+      - name: Check EC2 Windows Instances by OTEL Tag (Multi-Region)
+        id: get-instance-info
+        run: |
+          $TAG_KEY = "OTEL"
+          $TAG_VALUE = "True"
+          $US_REGIONS = @("us-east-1", "us-east-2", "us-west-1", "us-west-2")
+
+          # Hashtable: region -> list of instance IDs
+          $InstancesByRegion = @{}
+
+          foreach ($REGION in $US_REGIONS) {
+              Write-Host "Checking region: $REGION"
+
+              $instances_json = aws ec2 describe-instances `
+                  --region $REGION `
+                  --filters `
+                      "Name=tag:$TAG_KEY,Values=$TAG_VALUE" `
+                      "Name=platform,Values=windows" `
+                      "Name=instance-state-name,Values=running" `
+                  --query 'Reservations[].Instances[].InstanceId' `
+                  --output json
+
+              if ($instances_json) {
+                  $instances = $instances_json | ConvertFrom-Json
+                  if ($instances -and $instances.Count -gt 0) {
+                      $InstancesByRegion[$REGION] = $instances
+                      Write-Host "Found $($instances.Count) instance(s) in $REGION"
+                  } else {
+                      Write-Host "No instances found in $REGION"
+                  }
+              } else {
+                  Write-Host "No response or empty result for $REGION"
+              }
+          }
+
+          if ($InstancesByRegion.Count -eq 0) {
+              Write-Host "No Windows instances found with OTEL=$TAG_VALUE tag in any region"
+              exit 0
+          }
+
+          # Flatten all instance IDs into a single list for other steps
+          $AllInstances = $InstancesByRegion.Values | ForEach-Object { $_ } | ForEach-Object { $_ }
+
+          Write-Host "All matching instance IDs: $($AllInstances -join ', ')"
+
+          # Export instances and regions as environment variables
+          # You can export the instance IDs for later steps
+          echo "ACTIVE_INSTANCE_IDS=$($AllInstances -join ' ')" >> $env:GITHUB_ENV
+
+          # Also export the instance-to-region mapping as JSON string
+          $regionMapJson = $InstancesByRegion | ConvertTo-Json -Compress
+          echo "INSTANCES_BY_REGION=$regionMapJson" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Copy Missing Config Files and Commit - Windows
+        shell: pwsh
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          $CHANGES_MADE = $false
+
+          foreach ($INSTANCE_ID in $env:ACTIVE_INSTANCE_IDS -split ' ') {
+              $CONFIG_FILE = "agents\otel\config\Windows\$INSTANCE_ID.yaml"
+
+              # If the config file is missing, copy the default config and commit it
+              if (-not (Test-Path $CONFIG_FILE)) {
+                  Write-Host "Config file for $INSTANCE_ID not found. Copying default..."
+                  Copy-Item "agents\otel\config\aws-otel-agent-coralogix-sherpa.yaml" $CONFIG_FILE
+                  git add $CONFIG_FILE
+                  $CHANGES_MADE = $true
+              }
+          }
+
+          # Commit and push if new config files were copied
+          if ($CHANGES_MADE) {
+              git commit -m "Copy default config files for instances [ci skip]"
+              git push origin main
+          } else {
+              Write-Host "No new config files copied, no push needed."
+          }
+        env:
+          GITHUB_TOKEN: ${{ secrets.ILLIA_GITHUB_TOKEN }}
+
+      - name: Inject Private API Key into Config Files
+        run: |
+          foreach ($INSTANCE_ID in $env:ACTIVE_INSTANCE_IDS -split ' ') {
+            $CONFIG_FILE = "agents/otel/config/Windows/$INSTANCE_ID.yaml"
+            
+            if (Test-Path $CONFIG_FILE) {
+              $private_key = $env:TEST_private_KEY
+              $REPLACE_KEY = "private_key: `"${private_key}`""
+              (Get-Content $CONFIG_FILE) -replace 'private_key: "REPLACE_ME"', $REPLACE_KEY | Set-Content $CONFIG_FILE
+            }
+          }
+        env:
+          SHERPA_PRIVATE_KEY: ${{ secrets.SHERPA_PRIVATE_KEY }}
+
+      - name: Install or Update OpenTelemetry on EC2 instances
+        id: install-opentelemetry
+        run: |
+          echo "Finding EC2 instance IDs from filenames..."
+          $INSTANCE_IDS = $env:ACTIVE_INSTANCE_IDS -split ' '
+          $INSTALLED_INSTANCES = @()
+          $UPDATED_INSTANCES = @()
+          $INSTALLED_VERSIONS = @()
+          $instancesByRegion = $env:INSTANCES_BY_REGION | ConvertFrom-Json
+
+          foreach ($INSTANCE_ID in $env:ACTIVE_INSTANCE_IDS -split ' ') {
+              $region = $null
+              foreach ($key in $instancesByRegion.PSObject.Properties.Name) {
+                  if ($instancesByRegion.$key -contains $INSTANCE_ID) {
+                      $region = $key
+                      break
+                  }
+              }
+              if (-not $region) {
+                  Write-Host "Could not find region for instance $INSTANCE_ID, skipping..."
+                  continue
+              }
+              
+              # Fetch the latest OpenTelemetry Collector version
+              $LATEST_VERSION = ((Invoke-RestMethod -Uri "https://api.github.com/repos/open-telemetry/opentelemetry-collector-releases/releases/latest").tag_name).Substring(1)
+              Write-Host "Latest OpenTelemetry Collector version: $LATEST_VERSION"
+              
+              # Check installed version via SSM
+              $CHECK_VERSION_CMD_ID = aws ssm send-command `
+                  --document-name "AWS-RunPowerShellScript" `
+                  --region $region `
+                  --instance-ids "$INSTANCE_ID" `
+                  --parameters "commands=['if (Get-ChildItem -Path C:\OpenTelemetry\otelcol-contrib*.exe) { & `"C:\OpenTelemetry\otelcol-contrib.exe`" --version } else { echo NOT_INSTALLED }']" `
+                  --query "Command.CommandId" --output text
+
+              
+              Write-Host "SSM Command ID for ${INSTANCE_ID}: ${CHECK_VERSION_CMD_ID}"
+              if (-not $CHECK_VERSION_CMD_ID) {
+                  Write-Host "!!!Failed to send version check command to $INSTANCE_ID. Skipping..."
+                  continue
+              }
+              Start-Sleep -Seconds 5
+              $INSTALLED_VERSION = aws ssm get-command-invocation `
+                  --command-id "$CHECK_VERSION_CMD_ID" `
+                  --region $region `
+                  --instance-id "$INSTANCE_ID" `
+                  --query 'StandardOutputContent' `
+                  --output text
+              $INSTALLED_VERSION = $INSTALLED_VERSION.Trim()
+              Write-Host "Raw command output: $INSTALLED_VERSION"
+              
+              if ($INSTALLED_VERSION -eq "NOT_INSTALLED") {
+                  Write-Host "!!! OpenTelemetry Agent is NOT installed on $INSTANCE_ID. Proceeding with installation..."
+                  $INSTALLED_INSTANCES += $INSTANCE_ID
+              } else {
+                  $INSTALLED_VERSION = ($INSTALLED_VERSION | Select-String -Pattern '[0-9]+(\.[0-9]+)*' | ForEach-Object { $_.Matches.Value }) -join ' '
+                  Write-Host "Installed version on ${INSTANCE_ID}: ${INSTALLED_VERSION}"
+                  if ($INSTALLED_VERSION -ne $LATEST_VERSION) {
+                      Write-Host "Upgrading OpenTelemetry Agent on $INSTANCE_ID (from $INSTALLED_VERSION to $LATEST_VERSION)..."
+                      $UPDATED_INSTANCES += $INSTANCE_ID
+                  } else {
+                      Write-Host "OpenTelemetry Agent is already up-to-date ($LATEST_VERSION) on $INSTANCE_ID. Skipping update."
+                      $INSTALLED_VERSIONS += "${INSTANCE_ID}:${INSTALLED_VERSION}"
+                      continue
+                  }
+              }
+              
+              # Define the installation directory and TAR download path
+              $DirectoryPath = "C:\OpenTelemetry"
+              $MSI_DOWNLOAD_PATH = "$DirectoryPath\otelcol-installer.tar.gz"
+              
+              # Ensure the directory exists via SSM
+              $CREATE_DIR_CMD_ID = aws ssm send-command `
+                  --document-name "AWS-RunPowerShellScript" `
+                  --region $region `
+                  --instance-ids "$INSTANCE_ID" `
+                  --parameters "commands=['if (-not (Test-Path -Path $DirectoryPath)) { New-Item -Path $DirectoryPath -ItemType Directory -Force }']" `
+                  --query "Command.CommandId" --output text
+              
+              # Now confirm directory is present via SSM
+              Start-Sleep -Seconds 5
+              $CHECK_DIR_CMD_ID = aws ssm send-command `
+                  --document-name "AWS-RunPowerShellScript" `
+                  --region $region `
+                  --instance-ids "$INSTANCE_ID" `
+                  --parameters "commands=['if (Test-Path -Path $DirectoryPath) { echo Directory Exists } else { echo Directory Missing }']" `
+                  --query "Command.CommandId" --output text
+          
+              # Fetch command result
+              $CHECK_DIR_RESULT = aws ssm get-command-invocation `
+                  --command-id "$CHECK_DIR_CMD_ID" `
+                  --region $region `
+                  --instance-id "$INSTANCE_ID" `
+                  --query 'StandardOutputContent' `
+                  --output text
+          
+              if ($CHECK_DIR_RESULT -like "*Directory Missing*") {
+                  Write-Host "!!! Directory still does not exist on $INSTANCE_ID. Exiting..."
+                  exit 1
+              }
+              Write-Host "Directory confirmed: $DirectoryPath. Starting to download."
+              
+              # Build the URL and MSI path
+              $OTEL_URL = "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v$LATEST_VERSION/otelcol-contrib_${LATEST_VERSION}_windows_amd64.tar.gz"
+              $MSI_PATH = "C:\\OpenTelemetry\\otelcol-installer-v$LATEST_VERSION.tar.gz"
+              $EXTRACTED_DIR = "C:\\OpenTelemetry\\"
+              $LOCAL_CONFIG_FILE_PATH = "agents/otel/config/Windows/$INSTANCE_ID.yaml"
+              $REAL_LOCAL_CONFIG_CONTENT = Get-Content -Path $LOCAL_CONFIG_FILE_PATH -Raw
+              $ENCODED = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($REAL_LOCAL_CONFIG_CONTENT))
+
+
+              # Download the otel-contrib file via SSM
+              $MSI_COMMAND = "Invoke-WebRequest -Uri `"$OTEL_URL`" -OutFile `"$MSI_PATH`" -Headers @{`"Accept`"=`"application/octet-stream`"}"
+
+              $MSI_DOWNLOAD_CMD_ID = aws ssm send-command `
+                  --document-name "AWS-RunPowerShellScript" `
+                  --region $region `
+                  --instance-ids "$INSTANCE_ID" `
+                  --parameters "commands=['$MSI_COMMAND']" `
+                  --query "Command.CommandId" `
+                  --output text
+
+              Write-Host "Otel-Contrib download started. Sleeping for 150 seconds to allow the download to complete..."
+
+              Start-Sleep -Seconds 150
+
+              # Stop the OpenTelemetry service before extracting the new files
+              $STOP_SERVICE_CMD = "Stop-Service -Name otelcol -Force"
+              $STOP_SERVICE_CMD_ID = aws ssm send-command `
+                  --region $region `
+                  --document-name "AWS-RunPowerShellScript" `
+                  --instance-ids "$INSTANCE_ID" `
+                  --parameters "commands=['$STOP_SERVICE_CMD']" `
+                  --query "Command.CommandId" `
+                  --output text
+
+              Write-Host "Stopping otelcol service. Waiting for it to stop..."
+
+              # Optionally wait a bit for service to stop gracefully
+              Start-Sleep -Seconds 10
+
+              # Extract the archive
+              $EXTRACT_CMD = "tar -xzf `"$MSI_PATH`" -C `"$EXTRACTED_DIR`""
+
+              $EXTRACT_CMD_ID = aws ssm send-command `
+                  --document-name "AWS-RunPowerShellScript" `
+                  --instance-ids "$INSTANCE_ID" `
+                  --region $region `
+                  --parameters "commands=['$EXTRACT_CMD']" `
+                  --query "Command.CommandId" `
+                  --output text
+
+              Write-Host "Extracting complete. Process with uploading config and installation"
+
+              $UPLOAD_CMD = "[System.IO.File]::WriteAllBytes('C:\OpenTelemetry\otel-config.yaml', [Convert]::FromBase64String('$ENCODED'))"
+              $UPLOAD_CMD_JSON = @($UPLOAD_CMD) | ConvertTo-Json -Compress
+
+              $UPLOAD_CMD_ID = aws ssm send-command `
+                --instance-ids $INSTANCE_ID `
+                --document-name "AWS-RunPowerShellScript" `
+                --parameters "commands=$UPLOAD_CMD_JSON" `
+                --region $region `
+                --comment "Initial upload of otel-config.yaml"
+
+              $SERVICE_CREATE_CMD = 'New-Service -Name "otelcol" -BinaryPathName "`"C:\OpenTelemetry\otelcol-contrib.exe`" --config `"C:\OpenTelemetry\otel-config.yaml`"" -DisplayName "OpenTelemetry Collector" -Description "OpenTelemetry Collector Service" -StartupType Automatic'
+              $SERVICE_CREATE_CMD_ID = aws ssm send-command `
+                  --document-name "AWS-RunPowerShellScript" `
+                  --region $region `
+                  --instance-ids "$INSTANCE_ID" `
+                  --parameters "commands=['$SERVICE_CREATE_CMD']" `
+                  --comment "Create and start OpenTelemetry Collector service" `
+                  --query "Command.CommandId" `
+                  --output text
+
+              #Start Otel Service
+              $START_SERVICE_CMD = 'Start-Service -Name "otelcol"'
+              $START_SERVICE_CMD_ID = aws ssm send-command `
+                --document-name "AWS-RunPowerShellScript" `
+                --instance-ids "$INSTANCE_ID" `
+                --region $region `
+                --parameters "commands=['$START_SERVICE_CMD']" `
+                --comment "Start OpenTelemetry Collector service" `
+                --query "Command.CommandId" `
+                --output text
+    
+          $INSTALLED_VERSIONS += "${INSTANCE_ID}:${LATEST_VERSION}"
+          }
+          echo "INSTALLED_VERSIONS=$($INSTALLED_VERSIONS -join ' ')" >> $env:GITHUB_ENV
+          echo "UPDATED_INSTANCES=$($UPDATED_INSTANCES -join ' ')" >> $env:GITHUB_ENV
+          echo "INSTALLED_INSTANCES=$($INSTALLED_INSTANCES -join ' ')" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Compare Local and Remote otelcol Config via Hash
+        run: |
+          $UPDATED_CONFIG_INSTANCES = @()
+          $instancesByRegion = $env:INSTANCES_BY_REGION | ConvertFrom-Json
+
+          foreach ($INSTANCE_ID in $env:ACTIVE_INSTANCE_IDS -split ' ') {
+            # Determine region for this instance
+            $region = $null
+            foreach ($key in $instancesByRegion.PSObject.Properties.Name) {
+              if ($instancesByRegion.$key -contains $INSTANCE_ID) {
+                $region = $key
+                break
+              }
+            }
+
+            if (-not $region) {
+              Write-Host "Region not found for $INSTANCE_ID — skipping"
+              continue
+            }
+
+            $LOCAL_PATH = "agents/otel/config/Windows/$INSTANCE_ID.yaml"
+            if (-not (Test-Path $LOCAL_PATH)) {
+              Write-Host "Local config $LOCAL_PATH not found. Skipping $INSTANCE_ID"
+              continue
+            }
+
+            $LOCAL_HASH = (Get-FileHash -Path $LOCAL_PATH -Algorithm SHA256).Hash
+            Write-Host "Local hash for ${INSTANCE_ID}: ${LOCAL_HASH}"
+
+            $CMD_GET_HASH = 'Get-FileHash -Path "C:\OpenTelemetry\otel-config.yaml" -Algorithm SHA256 | Select-Object -ExpandProperty Hash'
+            $COMMANDS_JSON = @($CMD_GET_HASH) | ConvertTo-Json -Compress
+
+            $CMD_ID = aws ssm send-command `
+              --instance-ids $INSTANCE_ID `
+              --document-name "AWS-RunPowerShellScript" `
+              --parameters "commands=$COMMANDS_JSON" `
+              --region $region `
+              --comment "Get otel config hash from server" `
+              --query "Command.CommandId" `
+              --output text
+
+            if (-not $CMD_ID) {
+              Write-Host "Failed to send command to $INSTANCE_ID"
+              continue
+            }
+
+            Start-Sleep -Seconds 5
+
+            $REMOTE_HASH = aws ssm get-command-invocation `
+              --command-id $CMD_ID `
+              --region $region `
+              --instance-id $INSTANCE_ID `
+              --query 'StandardOutputContent' `
+              --output text | Out-String
+            $REMOTE_HASH = $REMOTE_HASH.Trim()
+
+            Write-Host "Remote hash for ${INSTANCE_ID}: ${REMOTE_HASH}"
+
+            if ($REMOTE_HASH -ne $LOCAL_HASH) {
+              Write-Host "Config mismatch on $INSTANCE_ID — needs update"
+
+              $CONFIG_CONTENT = Get-Content -Path $LOCAL_PATH -Raw
+              $ENCODED = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($CONFIG_CONTENT))
+
+              $REMOTE_CMD = "Set-Content -Path 'C:\OpenTelemetry\otel-config.yaml' -Value ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('$ENCODED'))) -Force; Restart-Service -Name 'otelcol' -Force"
+              $COMMANDS_JSON = @($REMOTE_CMD) | ConvertTo-Json -Compress
+
+              $UPDATE_CMD_ID = aws ssm send-command `
+                --instance-ids $INSTANCE_ID `
+                --document-name "AWS-RunPowerShellScript" `
+                --parameters "commands=$COMMANDS_JSON" `
+                --region $region `
+                --comment "Update otel config on server" `
+                --query "Command.CommandId" `
+                --output text
+
+              Write-Host "Sent update command to $INSTANCE_ID. Command ID: $UPDATE_CMD_ID"
+              $UPDATED_CONFIG_INSTANCES += $INSTANCE_ID
+            } else {
+              Write-Host "Config is up to date on $INSTANCE_ID"
+            }
+          }
+
+          Write-Host "Setting UPDATED_CONFIG_INSTANCES to environment variable"
+          echo "UPDATED_CONFIG_INSTANCES=$($UPDATED_CONFIG_INSTANCES -join ' ')" >> $env:GITHUB_ENV
+        shell: pwsh
+
+
+      - name: Check and Start OpenTelemetry Service on EC2 Instances
+        run: |
+          $instancesByRegion = $env:INSTANCES_BY_REGION | ConvertFrom-Json
+
+          foreach ($INSTANCE_ID in $env:ACTIVE_INSTANCE_IDS -split ' ') {
+            Write-Host "Checking otelcol service status on $INSTANCE_ID"
+
+            # Determine region from INSTANCES_BY_REGION
+            $region = $null
+            foreach ($key in $instancesByRegion.PSObject.Properties.Name) {
+              if ($instancesByRegion.$key -contains $INSTANCE_ID) {
+                $region = $key
+                break
+              }
+            }
+
+            if (-not $region) {
+              Write-Host "Region not found for $INSTANCE_ID — skipping"
+              continue
+            }
+
+            # Step 1: Check otelcol status
+            $CHECK_STATUS_CMD = 'if ((Get-Service -Name "otelcol").Status -eq "Running") { echo "Service Running" } else { echo "Service Not Running" }'
+            $COMMANDS_JSON = @($CHECK_STATUS_CMD) | ConvertTo-Json -Compress
+
+            $CMD_ID = aws ssm send-command `
+              --instance-ids $INSTANCE_ID `
+              --document-name "AWS-RunPowerShellScript" `
+              --parameters "commands=$COMMANDS_JSON" `
+              --region $region `
+              --comment "Check otelcol service status" `
+              --query "Command.CommandId" `
+              --output text
+
+            Start-Sleep -Seconds 5
+
+            $SERVICE_STATUS = aws ssm get-command-invocation `
+              --command-id $CMD_ID `
+              --instance-id $INSTANCE_ID `
+              --region $region `
+              --query 'StandardOutputContent' `
+              --output text | Out-String
+            $SERVICE_STATUS = $SERVICE_STATUS.Trim()
+
+            Write-Host "otelcol status on $INSTANCE_ID current: $SERVICE_STATUS"
+
+            # Step 2: If not running, start the service
+            if ($SERVICE_STATUS -eq "Service Not Running") {
+              Write-Host "otelcol is not running on $INSTANCE_ID. Attempting to start it..."
+
+              $START_CMD = 'Start-Service -Name "otelcol"; Start-Sleep -Seconds 2; Get-Service -Name "otelcol" | Select-Object -ExpandProperty Status'
+              $COMMANDS_JSON = @($START_CMD) | ConvertTo-Json -Compress
+
+              $CMD_ID = aws ssm send-command `
+                --instance-ids $INSTANCE_ID `
+                --document-name "AWS-RunPowerShellScript" `
+                --parameters "commands=$COMMANDS_JSON" `
+                --region $region `
+                --comment "Start otelcol service if stopped" `
+                --query "Command.CommandId" `
+                --output text
+
+              Start-Sleep -Seconds 5
+
+              $NEW_STATUS = aws ssm get-command-invocation `
+                --command-id $CMD_ID `
+                --instance-id $INSTANCE_ID `
+                --region $region `
+                --query 'StandardOutputContent' `
+                --output text | Out-String
+              $NEW_STATUS = $NEW_STATUS.Trim()
+
+              Write-Host "otelcol restarted on $INSTANCE_ID. New status: $NEW_STATUS"
+            }
+          }
+        shell: pwsh
+
+      - name: Final Summary
+        run: |
+          Write-Host "OpenTelemetry Installation & Configuration Summary"
+          Write-Host "---------------------------------------------"
+          
+          # Show installed versions
+          $INSTALLED_VERSIONS = $env:INSTALLED_VERSIONS
+          if (-not $INSTALLED_VERSIONS) { $INSTALLED_VERSIONS = "No new installations" }
+          Write-Host "Installed OpenTelemetry on Instances:  $INSTALLED_VERSIONS"
+          
+          # Show updated instances
+          $UPDATED_INSTANCES = $env:UPDATED_INSTANCES
+          if (-not $UPDATED_INSTANCES) { $UPDATED_INSTANCES = "No updates" }
+          Write-Host "Updated OpenTelemetry on Instances: $UPDATED_INSTANCES"
+
+          # Show updated config instances
+          $UPDATED_CONFIG_INSTANCES = $env:UPDATED_CONFIG_INSTANCES
+          if (-not $UPDATED_CONFIG_INSTANCES) { $UPDATED_CONFIG_INSTANCES = "No updated config instances" }
+          Write-Host "Updated Configurations on Instances: $UPDATED_CONFIG_INSTANCES"
+
+          # Parse region mapping
+          $instancesByRegion = $env:INSTANCES_BY_REGION | ConvertFrom-Json
+
+          # Check status of otelcol service for each instance
+          foreach ($INSTANCE_ID in $env:ACTIVE_INSTANCE_IDS -split ' ') {
+            Write-Host "Checking status for $INSTANCE_ID..."
+
+            # Find region for this instance
+            $region = $null
+            foreach ($key in $instancesByRegion.PSObject.Properties.Name) {
+              if ($instancesByRegion.$key -contains $INSTANCE_ID) {
+                $region = $key
+                break
+              }
+            }
+
+            if (-not $region) {
+              Write-Host "!!! Region not found for $INSTANCE_ID — skipping"
+              continue
+            }
+
+            $CHECK_STATUS_CMD = 'if ((Get-Service -Name "otelcol").Status -eq "Running") { echo "Service Running" } else { echo "Service Not Running" }'
+            $COMMANDS_JSON = @($CHECK_STATUS_CMD) | ConvertTo-Json -Compress
+
+            $CMD_ID = aws ssm send-command `
+              --instance-ids $INSTANCE_ID `
+              --document-name "AWS-RunPowerShellScript" `
+              --parameters "commands=$COMMANDS_JSON" `
+              --region $region `
+              --comment "Check otelcol service status" `
+              --query "Command.CommandId" `
+              --output text
+
+            if (-not $CMD_ID) {
+              Write-Host "!!! Failed to send status check command to $INSTANCE_ID"
+              continue
+            }
+
+            Start-Sleep -Seconds 5
+
+            $SERVICE_STATUS = aws ssm get-command-invocation `
+              --command-id $CMD_ID `
+              --region $region `
+              --instance-id $INSTANCE_ID `
+              --query 'StandardOutputContent' `
+              --output text | Out-String
+            $SERVICE_STATUS = $SERVICE_STATUS.Trim()
+
+            Write-Host "$INSTANCE_ID otelcol service status: $SERVICE_STATUS"
+          }
+
+          Write-Host "---------------------------------------------"
+          Write-Host -ForegroundColor Green "OpenTelemetry setup completed successfully!"
+        shell: pwsh
+
+
+

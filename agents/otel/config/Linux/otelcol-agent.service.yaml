@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenTelemetry Agent
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/otelcol-agent --config /etc/otel-agent-config.yaml
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

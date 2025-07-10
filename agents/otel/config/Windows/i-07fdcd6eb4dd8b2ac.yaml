@@ -1,0 +1,55 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+  hostmetrics:
+    collection_interval: 10s
+    scrapers:
+      paging:
+        metrics:
+          system.paging.utilization:
+            enabled: true
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk:
+      filesystem:
+        metrics:
+          system.filesystem.utilization:
+            enabled: true
+      load:
+      network:
+      processes:
+
+exporters:
+  coralogix:
+    domain: "cx498.coralogix.com"
+    private_key: "REPLACE_ME"
+    subsystem_name: "otel"
+    application_name: "sherpa"
+
+processors:
+  batch:
+  resourcedetection:
+    detectors: [ec2]
+    timeout: 2s
+    override: false
+
+extensions:
+  health_check: {}
+  pprof: {}
+
+service:
+  extensions: [health_check, pprof]
+  pipelines:
+    metrics:
+      receivers: [hostmetrics]
+      processors: [batch, resourcedetection]
+      exporters: [coralogix]
