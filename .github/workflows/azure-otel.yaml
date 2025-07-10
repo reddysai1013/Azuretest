@@ -13,7 +13,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.charan_TOKEN }}
+          token: ${{ secrets.CHARAN_TOKEN }}
 
       - name: Login to Azure
         uses: azure/login@v2
