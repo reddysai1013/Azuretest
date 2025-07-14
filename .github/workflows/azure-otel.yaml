@@ -129,7 +129,7 @@ jobs:
             echo "No new config files copied, no push needed."
           fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.CHARAN_TOKEN }}
 
       - name: Fetch Private Key from Azure Key Vault
         run: |
