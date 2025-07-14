@@ -132,15 +132,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.CHARAN_TOKEN }}
 
-      - name: Fetch Private Key from Azure Key Vault
-        run: |
-          PRIVATE_KEY=$(az keyvault secret show \
-            --vault-name "${{ secrets.AZURE_KEY_VAULT_NAME }}" \
-            --name "sherpa-private-key" \
-            --query "value" \
-            --output tsv)
-          echo "SHERPA_PRIVATE_KEY=$PRIVATE_KEY" >> $GITHUB_ENV
-
       - name: Install or Update OpenTelemetry Agent per VM
         run: |
           INSTALLED_VMS=()
