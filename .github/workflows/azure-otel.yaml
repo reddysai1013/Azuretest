@@ -1,9 +1,9 @@
 name: Azure Install/Update & Configure OpenTelemetry Agent
 
 on:
-  push:
-    branches:
-      - main
+  schedule:
+    - cron: "0 0 1 * *"  # Runs at 00:00 UTC on the 1st of every month
+  workflow_dispatch:  # Allows manual execution
 
 jobs:
   otel-contrib-agent:
@@ -16,24 +16,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.CHARAN_TOKEN }}
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Validate Secrets
-        run: |
-          if [[ -z "${{ secrets.AZURE_CLIENT_ID }}" || -z "${{ secrets.AZURE_TENANT_ID }}" || -z "${{ secrets.AZURE_SUBSCRIPTION_ID }}" || -z "${{ secrets.CHARAN_TOKEN }}" ]]; then
-            echo "Error: One or more required secrets (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, CHARAN_TOKEN) are missing."
-            exit 1
-          fi
-
       - name: Azure CLI Login
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Get Azure Linux VMs by OTEL Tag
         id: get-linux-vms
         run: |
@@ -41,11 +29,10 @@ jobs:
           az vm list \
             --show-details \
             --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState}" \
-            --output tsv > linux_vms.tsv || { echo "Failed to list VMs"; exit 1; }
+            --output tsv > linux_vms.tsv
           
           if [[ ! -s linux_vms.tsv ]]; then
             echo "No Linux VMs found with OTEL=True tag"
-            echo "VM_NAMES=" >> $GITHUB_ENV
             exit 0
           fi
           
@@ -55,178 +42,355 @@ jobs:
           VM_NAMES=$(awk '{print $1}' linux_vms.tsv | tr '\n' ' ' | sed 's/ *$//')
           echo "Found Linux VM Names: $VM_NAMES"
           echo "VM_NAMES=$VM_NAMES" >> $GITHUB_ENV
-
       - name: Upload TSV as Artifact
-        if: steps.get-linux-vms.outputs.VM_NAMES != ''
         uses: actions/upload-artifact@v4
         with:
           name: linux-vms-tsv
           path: linux_vms.tsv
-
-      - name: Ensure Run Command Extension
-        run: |
-          echo "Installing run command extension on VMs..."
-          mkdir -p extension_logs
-          
-          while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
-            if [[ "$VM_STATE" == "PowerState/running" || "$VM_STATE" == "VM running" ]]; then
-              echo "Installing run command extension on $VM_NAME..."
-              az vm extension set \
-                --name RunCommandLinux \
-                --publisher Microsoft.CPlat.Core \
-                --vm-name "$VM_NAME" \
-                --resource-group "$RESOURCE_GROUP" \
-                --no-wait \
-                --output json > "extension_logs/${VM_NAME}_extension.json" 2>&1 || echo "Extension might already be installed on $VM_NAME"
-            fi
-          done < linux_vms.tsv
-          
-          echo "Waiting for extensions to be ready..."
-          sleep 45
-
       - name: Check VMs/Architectures/Status
         run: |
           ACTIVE_VM_NAMES=()
           SKIPPED_VMS=()
-          echo "Skipped VMs:" > skipped_vms.log
-          mkdir -p debug_logs
 
           while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
             echo "Checking $VM_NAME in resource group $RESOURCE_GROUP"
             
-            # Handle missing or unknown VM_STATE
-            if [[ -z "$VM_STATE" || "$VM_STATE" == "Unknown" ]]; then
-              echo "VM_STATE missing or unknown for $VM_NAME, querying Azure..."
-              VM_STATE=$(az vm get-instance-view \
-                --name "$VM_NAME" \
-                --resource-group "$RESOURCE_GROUP" \
-                --query 'instanceView.statuses[?code==`PowerState/running`].code' \
-                --output tsv 2>/dev/null || echo "")
-              
-              if [[ -z "$VM_STATE" ]]; then
-                echo "Failed to retrieve state for $VM_NAME. Skipping..." | tee -a skipped_vms.log
-                SKIPPED_VMS+=("$VM_NAME")
-                continue
-              fi
-            fi
-
-            # Check if VM is running
-            if [[ "$VM_STATE" != "PowerState/running" && "$VM_STATE" != "VM running" ]]; then
-              echo "VM $VM_NAME is in state: $VM_STATE. Skipping..." | tee -a skipped_vms.log
+            # Use VM_STATE from linux_vms.tsv
+            if [[ "$VM_STATE" != "VM running" ]]; then
+              echo "!!!VM $VM_NAME is in state: $VM_STATE. Skipping..."
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
 
-            echo "VM $VM_NAME is running. Getting architecture..."
-            
-            # Get architecture with improved error handling
-            RESULT=$(az vm run-command invoke \
+            echo "VM $VM_NAME is running. Proceeding with architecture check."
+            ACTIVE_VM_NAMES+=("$VM_NAME")
+
+            # Check architecture
+            CMD_OUTPUT=$(az vm run-command invoke \
               --name "$VM_NAME" \
               --resource-group "$RESOURCE_GROUP" \
               --command-id RunShellScript \
-              --scripts "uname -m" \
-              --output json 2>&1)
+              --scripts 'uname -m' \
+              --query 'value[0].message' \
+              --output tsv 2>/dev/null || echo "ERROR")
             
-            if [[ $? -ne 0 ]]; then
-              echo "Failed to run command on $VM_NAME: $RESULT" | tee -a "debug_logs/${VM_NAME}.log"
-              echo "Command execution failed for $VM_NAME. Skipping..." | tee -a skipped_vms.log
+            if [[ "$CMD_OUTPUT" == "ERROR" || -z "$CMD_OUTPUT" ]]; then
+              echo "!!!Failed to retrieve architecture for $VM_NAME. Skipping..."
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
-            
-            # Log the full result for debugging
-            echo "Full command result for $VM_NAME:" >> "debug_logs/${VM_NAME}.log"
-            echo "$RESULT" >> "debug_logs/${VM_NAME}.log"
-            
-            # Extract architecture from JSON output
-            ARCH=$(echo "$RESULT" | jq -r '.value[0].message' 2>/dev/null | grep -oP '(?<=stdout\]\n)[^\n\r]*(?=\n|\r|\[stderr\])' | tr -d '\r\n' | xargs)
-            
-            if [[ -z "$ARCH" ]]; then
-              echo "Could not determine architecture for $VM_NAME" | tee -a "debug_logs/${VM_NAME}.log"
-              echo "Architecture parsing failed for $VM_NAME. Skipping..." | tee -a skipped_vms.log
+
+            SYSTEM_ARCH=$(echo "$CMD_OUTPUT" | sed -n 's/.*\[stdout\]\(.*\)\[stderr\].*/\1/p' | tr -d '\n')
+            if [[ -z "$SYSTEM_ARCH" ]]; then
+              echo "!!!Failed to parse architecture for $VM_NAME. Skipping..."
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
-            
-            echo "Detected architecture for $VM_NAME: '$ARCH'" >> "debug_logs/${VM_NAME}.log"
-            
-            # Map architecture to standard names
-            case "$ARCH" in
+            case "$SYSTEM_ARCH" in
               x86_64) ARCH_NAME="amd64" ;;
               aarch64|arm64) ARCH_NAME="arm64" ;;
-              *)
-                echo "Unsupported architecture: '$ARCH' on $VM_NAME. Skipping..." | tee -a skipped_vms.log
-                SKIPPED_VMS+=("$VM_NAME")
-                continue
-                ;;
+              *) echo "!!!Unsupported architecture: $SYSTEM_ARCH on $VM_NAME. Skipping..."; SKIPPED_VMS+=("$VM_NAME"); continue ;;
             esac
 
             echo "VM $VM_NAME is using architecture: $ARCH_NAME"
-            ACTIVE_VM_NAMES+=("$VM_NAME")
-            
-            # Create safe environment variable names
-            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | sed 's/^[0-9]/_&/')
-            
-            if [[ -n "$SAFE_VM_NAME" ]]; then
-              echo "ARCH_$SAFE_VM_NAME=$ARCH_NAME" >> $GITHUB_ENV
-              echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
-            else
-              echo "Could not create safe environment variable name for $VM_NAME" | tee -a skipped_vms.log
-            fi
-            
-            sleep 2  # Avoid Azure API rate limits
+
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr '-' '_')
+            echo "ARCH_$SAFE_VM_NAME=$ARCH_NAME" >> $GITHUB_ENV
+            echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
           done < linux_vms.tsv
 
           echo "Active VMs: ${ACTIVE_VM_NAMES[*]}"
           echo "Skipped VMs: ${SKIPPED_VMS[*]}"
           echo "SKIPPED_VMS=${SKIPPED_VMS[*]}" >> $GITHUB_ENV
-          
           if [[ ${#ACTIVE_VM_NAMES[@]} -eq 0 ]]; then
-            echo "No active VMs found! Exiting with warning..." | tee -a skipped_vms.log
-            exit 1
+            echo "!!!No active VMs found! Exiting..."
+            exit 0
           fi
 
           echo "ACTIVE_VM_NAMES=${ACTIVE_VM_NAMES[*]}" >> $GITHUB_ENV
 
-      - name: Upload Extension Logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: extension-logs
-          path: extension_logs/
-
-      - name: Upload Skipped VMs Log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: skipped-vms-log
-          path: skipped_vms.log
-
-      - name: Upload Debug Logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-logs
-          path: debug_logs/
-
-      # Debug step - remove after testing
-      - name: Debug Single VM (Remove after testing)
-        if: failure()
+      - name: Copy Missing Config Files and Commit - Linux
         run: |
-          echo "=== DEBUG: Testing single VM ==="
-          VM_NAME="test1"
-          RESOURCE_GROUP="EXAMPLE-RESOURCES"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+         
+          CHANGES_MADE=false
+         
+          for VM_NAME in $VM_NAMES; do
+            CONFIG_FILE="agents/otel/config/Linux/$VM_NAME.yaml"
+        
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+              echo "Config file for $VM_NAME not found. Copying default..."
+              cp agents/otel/config/Linux/otelcol-agent.service.yaml "$CONFIG_FILE"
+              
+              git add "$CONFIG_FILE"
+              CHANGES_MADE=true
+            fi
+          done
+
+          if [[ "$CHANGES_MADE" == true ]]; then
+            git commit -m "Copy default config files for VMs [ci skip]"
+            git push origin main
+          else
+            echo "No new config files copied, no push needed."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.CHARAN_TOKEN }}
+
+      - name: Install or Update OpenTelemetry Agent per VM
+        run: |
+          INSTALLED_VMS=()
+          UPDATED_VMS=()
+          INSTALLED_VERSIONS=()
           
-          echo "1. Checking VM status..."
-          az vm show --name "$VM_NAME" --resource-group "$RESOURCE_GROUP" --query "powerState" --output tsv
-          
-          echo "2. Testing simple run command..."
-          az vm run-command invoke \
-            --name "$VM_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --command-id RunShellScript \
-            --scripts "echo 'Hello World' && uname -m" \
-            --output json
-          
-          echo "3. Checking extensions..."
-          az vm extension list --vm-name "$VM_NAME" --resource-group "$RESOURCE_GROUP" --output table
+          LATEST_VERSION=$(curl -s https://api.github.com/repos/open-telemetry/opentelemetry-collector-releases/releases/latest | jq -r '.tag_name' | sed 's/v//')
+          echo "Latest OpenTelemetry Collector version: $LATEST_VERSION"
+
+          for VM_NAME in $ACTIVE_VM_NAMES; do
+            echo "Checking OpenTelemetry installation on VM: $VM_NAME"
+            
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr '-' '_')
+            RG_VAR="RG_$SAFE_VM_NAME"
+            RESOURCE_GROUP=${!RG_VAR}
+            
+            if [[ -z "$RESOURCE_GROUP" ]]; then
+              echo "Resource group not set for $VM_NAME (env var $RG_VAR missing)"
+              continue
+            fi
+
+            # Check if OpenTelemetry is installed
+            CHECK_VERSION_OUTPUT=$(az vm run-command invoke \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --command-id RunShellScript \
+              --scripts "if command -v /usr/local/bin/otelcol-agent; then /usr/local/bin/otelcol-agent --version | awk '{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+/) print $i}' | grep -oE '[0-9]+(\.[0-9]+)*'; else echo NOT_INSTALLED; fi" \
+              --query 'value[0].message' \
+              --output tsv 2>/dev/null || echo "ERROR")
+            
+            if [[ "$CHECK_VERSION_OUTPUT" == "ERROR" ]]; then
+              echo "!!!Failed to check version on $VM_NAME. Skipping..."
+              continue
+            fi
+
+            INSTALLED_VERSION=$(echo "$CHECK_VERSION_OUTPUT" | grep -oE '[0-9]+(\.[0-9]+)*' || echo "NOT_INSTALLED")
+            
+            if [[ "$INSTALLED_VERSION" == "NOT_INSTALLED" ]]; then
+              echo "!!!OpenTelemetry Agent is NOT installed on $VM_NAME. Proceeding with installation..."
+              INSTALLED_VMS+=("$VM_NAME")
+            elif [[ "$INSTALLED_VERSION" != "$LATEST_VERSION" ]]; then
+              echo "Upgrading OpenTelemetry Agent on $VM_NAME (from $INSTALLED_VERSION to $LATEST_VERSION)..."
+              UPDATED_VMS+=("$VM_NAME")
+            else
+              echo "OpenTelemetry Agent is already up-to-date ($LATEST_VERSION) on $VM_NAME. Skipping update."
+              INSTALLED_VERSIONS+=("$VM_NAME:$INSTALLED_VERSION")
+              continue
+            fi
+
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr '-' '_')
+            ARCH_VAR="ARCH_$SAFE_VM_NAME"
+            ARCH=${!ARCH_VAR}
+            
+            echo "Using architecture: $ARCH"
+
+            OTEL_URL="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${LATEST_VERSION}/otelcol-contrib_${LATEST_VERSION}_linux_${ARCH}.tar.gz"
+            
+            CONFIG_FILE="agents/otel/config/Linux/$VM_NAME.yaml"
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+              echo "!!!Config file for $VM_NAME not found! Skipping..."
+              continue
+            fi
+            CONFIG_CONTENT=$(base64 -w 0 < "$CONFIG_FILE" | sed "s/private_key: \"REPLACE_ME\"/private_key: \"${SHERPA_PRIVATE_KEY}\"/")
+
+            SERVICE_FILE="agents/otel/config/Linux/otelcol-agent.service.yaml"
+            if [[ ! -f "$SERVICE_FILE" ]]; then
+              echo "!!!Service file not found! Skipping..."
+              continue
+            fi
+            SERVICE_CONTENT=$(base64 -w 0 < "$SERVICE_FILE")
+
+            COMMAND_OUTPUT=$(az vm run-command invoke \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --command-id RunShellScript \
+              --scripts "
+                wget -O /tmp/otelcol.tar.gz '$OTEL_URL' &&
+                tar -xvf /tmp/otelcol.tar.gz -C /tmp &&
+                mv -f /tmp/otelcol-contrib /usr/local/bin/otelcol-agent &&
+                sudo chown root:root /usr/local/bin/otelcol-agent &&
+                chmod +x /usr/local/bin/otelcol-agent &&
+                echo '$CONFIG_CONTENT' | base64 --decode | sudo tee /etc/otel-agent-config.yaml > /dev/null &&
+                echo '$SERVICE_CONTENT' | base64 --decode | sudo tee /etc/systemd/system/otelcol-agent.service > /dev/null &&
+                sudo systemctl daemon-reload &&
+                sudo systemctl enable otelcol-agent &&
+                sudo systemctl restart otelcol-agent &&
+                sleep 5 &&
+                if [[ \$(systemctl is-active otelcol-agent) == 'active' ]]; then echo 'OpenTelemetry Agent is running successfully!'; else echo '❌ OpenTelemetry Agent failed to start.'; sudo journalctl -u otelcol-agent --no-pager --lines=50; exit 1; fi
+              " \
+              --query 'value[0].message' \
+              --output tsv 2>/dev/null || echo "ERROR")
+            
+            if [[ "$COMMAND_OUTPUT" == "ERROR" ]]; then
+              echo "!!!Failed to install/update OpenTelemetry on $VM_NAME"
+              continue
+            fi
+
+            INSTALLED_VERSIONS+=("$VM_NAME:$LATEST_VERSION")
+          done
+
+          echo "INSTALLED_VERSIONS=${INSTALLED_VERSIONS[*]}" >> $GITHUB_ENV
+          echo "UPDATED_VMS=${UPDATED_VMS[*]}" >> $GITHUB_ENV
+          echo "INSTALLED_VMS=${INSTALLED_VMS[*]}" >> $GITHUB_ENV
+
+      - name: Check and Update Configuration Files if Needed
+        run: |
+          UPDATED_CONFIG_VMS=()
+          FAILED_RESTART_VMS=()
+
+          for VM_NAME in $ACTIVE_VM_NAMES; do
+            echo "Checking configuration updates for $VM_NAME..."
+
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr '-' '_')
+            RG_VAR="RG_$SAFE_VM_NAME"
+            RESOURCE_GROUP=${!RG_VAR}
+
+            if [[ -z "$RESOURCE_GROUP" ]]; then
+              echo "Resource group not set for $VM_NAME (env var $RG_VAR missing)"
+              continue
+            fi
+
+            CONFIG_FILE="agents/otel/config/Linux/$VM_NAME.yaml"
+            DEFAULT_CONFIG_FILE="agents/otel/config/azure-otel-agent.yaml"
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+              if [[ -f "$DEFAULT_CONFIG_FILE" ]]; then
+                echo "Config file for $VM_NAME not found. Copying default config..."
+                cp "$DEFAULT_CONFIG_FILE" "$CONFIG_FILE"
+              else
+                echo "!!!Default config file not found! Skipping $VM_NAME..."
+                continue
+              fi
+            fi
+
+            SERVER_CHECKSUM=$(az vm run-command invoke \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --command-id RunShellScript \
+              --scripts "if [ -f /etc/otel-agent-config.yaml ]; then md5sum /etc/otel-agent-config.yaml | awk '{print \$1}'; else echo MISSING_FILE; fi" \
+              --query 'value[0].message' \
+              --output tsv 2>/dev/null || echo "ERROR")
+
+            if [[ "$SERVER_CHECKSUM" == "ERROR" ]]; then
+              echo "!!!Failed to retrieve checksum for $VM_NAME. Skipping..."
+              continue
+            fi
+
+            LOCAL_CHECKSUM=$(md5sum "$CONFIG_FILE" | awk '{print $1}')
+            
+            echo "Server Config Hash: $SERVER_CHECKSUM"
+            echo "Local Config Hash: $LOCAL_CHECKSUM"
+
+            if [[ "$SERVER_CHECKSUM" == "$LOCAL_CHECKSUM" ]]; then
+              echo "Config is already up-to-date on $VM_NAME. Skipping update."
+              continue
+            fi
+
+            echo "Config has changed! Updating on $VM_NAME..."
+            UPDATED_CONFIG_VMS+=("$VM_NAME")
+
+            CONFIG_CONTENT=$(base64 -w 0 < "$CONFIG_FILE" | sed "s/private_key: \"REPLACE_ME\"/private_key: \"${SHERPA_PRIVATE_KEY}\"/")
+
+            COMMAND_OUTPUT=$(az vm run-command invoke \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --command-id RunShellScript \
+              --scripts "
+                echo '$CONFIG_CONTENT' | base64 --decode | sudo tee /etc/otel-agent-config.yaml > /dev/null &&
+                sudo systemctl daemon-reload &&
+                sudo systemctl restart otelcol-agent &&
+                sleep 5 &&
+                if [[ \$(systemctl is-active otelcol-agent) == 'active' ]]; then echo 'OpenTelemetry Agent restarted successfully!'; else echo '❌ OpenTelemetry Agent failed to restart.'; sudo journalctl -u otelcol-agent --no-pager --lines=50; exit 1; fi
+              " \
+              --query 'value[0].message' \
+              --output tsv 2>/dev/null || echo "ERROR")
+
+            if [[ "$COMMAND_OUTPUT" == "ERROR" ]]; then
+              echo "!!!Failed to update config on $VM_NAME!"
+              FAILED_RESTART_VMS+=("$VM_NAME")
+              continue
+            fi
+
+            AGENT_STATUS=$(az vm run-command invoke \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --command-id RunShellScript \
+              --scripts "systemctl is-active otelcol-agent" \
+              --query 'value[0].message' \
+              --output tsv 2>/dev/null | tr -d '[:space:]')
+
+            if [[ "$AGENT_STATUS" == "active" ]]; then
+              echo "OpenTelemetry Agent is running successfully after restart on $VM_NAME."
+            else
+              echo "!!!OpenTelemetry Agent failed to restart on $VM_NAME!"
+              FAILED_RESTART_VMS+=("$VM_NAME")
+            fi
+          done
+
+          echo "UPDATED_CONFIG_VMS=${UPDATED_CONFIG_VMS[*]}" >> $GITHUB_ENV
+          echo "FAILED_RESTART_VMS=${FAILED_RESTART_VMS[*]}" >> $GITHUB_ENV
+
+      - name: Final Summary
+        run: |
+          echo "OpenTelemetry Installation & Configuration Summary"
+          echo "---------------------------------------------"
+    
+          ACTIVE_VMS="${ACTIVE_VM_NAMES:-}"
+          SKIPPED_VMS="${SKIPPED_VMS:-}"
+          UPDATED_CONFIG_VMS="${UPDATED_CONFIG_VMS:-}"
+          FAILED_RESTART_VMS="${FAILED_RESTART_VMS:-}"
+          INSTALLED_VERSIONS="${INSTALLED_VERSIONS:-}"
+          UPDATED_VMS="${UPDATED_VMS:-}"
+          INSTALLED_VMS="${INSTALLED_VMS:-}"
+      
+          echo "Active VMs Processed:"
+          if [[ -n "$INSTALLED_VERSIONS" ]]; then
+            for entry in $INSTALLED_VERSIONS; do
+              VM=$(echo $entry | cut -d: -f1)
+              VERSION=$(echo $entry | cut -d: -f2)
+              echo -e "\e[1;32m   - $VM running OpenTelemetry Agent version: $VERSION.\e[0m"
+            done
+          else
+            echo -e "\e[1;31m   - No active VMs detected.\e[0m"
+            exit 0
+          fi
+      
+          if [[ -n "$UPDATED_VMS" ]]; then
+            echo -e "\e[1;33mVMs Updated: $UPDATED_VMS.\e[0m"
+          else
+            echo -e "\e[1;34mNo VMs required an update.\e[0m"
+          fi
+     
+          if [[ -n "$INSTALLED_VMS" ]]; then
+            echo -e "\e[1;33mNewly Installed VMs: $INSTALLED_VMS\e[0m"
+          else
+            echo -e "\e[1;34mNo new installations were required.\e[0m"
+          fi
+    
+          if [[ -n "$UPDATED_CONFIG_VMS" ]]; then
+            echo -e "\e[1;33mConfigurations Updated on: $UPDATED_CONFIG_VMS\e[0m"
+          else
+            echo -e "\e[1;34mNo configuration updates were needed.\e[0m"
+          fi
+      
+          if [[ -z "$UPDATED_CONFIG_VMS" ]]; then
+            echo -e "\e[1;34mNo config changes detected. No restart needed.\e[0m"
+          elif [[ -n "$FAILED_RESTART_VMS" ]]; then
+            echo -e "\e[1;31mOpenTelemetry Agent FAILED to restart on: $FAILED_RESTART_VMS\e[0m"
+          else
+            echo -e "\e[1;32mAll agents restarted successfully after config update.\e[0m"
+          fi
+     
+          if [[ -n "$SKIPPED_VMS" ]]; then
+            echo -e "\e[1;33mVMs Skipped: $SKIPPED_VMS\e[0m"
+          fi
+     
+          echo "---------------------------------------------"
+          echo -e "\e[1;32mOpenTelemetry setup completed successfully!\e[0m"
