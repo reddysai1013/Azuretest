@@ -17,6 +17,9 @@ jobs:
         with:
           token: ${{ secrets.CHARAN_TOKEN }}
 
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Validate Secrets
         run: |
           if [[ -z "${{ secrets.AZURE_CLIENT_ID }}" || -z "${{ secrets.AZURE_TENANT_ID }}" || -z "${{ secrets.AZURE_SUBSCRIPTION_ID }}" || -z "${{ secrets.CHARAN_TOKEN }}" ]]; then
@@ -60,6 +63,27 @@ jobs:
           name: linux-vms-tsv
           path: linux_vms.tsv
 
+      - name: Ensure Run Command Extension
+        run: |
+          echo "Installing run command extension on VMs..."
+          mkdir -p extension_logs
+          
+          while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
+            if [[ "$VM_STATE" == "PowerState/running" || "$VM_STATE" == "VM running" ]]; then
+              echo "Installing run command extension on $VM_NAME..."
+              az vm extension set \
+                --name RunCommandLinux \
+                --publisher Microsoft.CPlat.Core \
+                --vm-name "$VM_NAME" \
+                --resource-group "$RESOURCE_GROUP" \
+                --no-wait \
+                --output json > "extension_logs/${VM_NAME}_extension.json" 2>&1 || echo "Extension might already be installed on $VM_NAME"
+            fi
+          done < linux_vms.tsv
+          
+          echo "Waiting for extensions to be ready..."
+          sleep 45
+
       - name: Check VMs/Architectures/Status
         run: |
           ACTIVE_VM_NAMES=()
@@ -67,110 +91,109 @@ jobs:
           echo "Skipped VMs:" > skipped_vms.log
           mkdir -p debug_logs
 
-          run_azure_cmd() {
-            local cmd="$1"
-            local vm_name="$2"
-            local output_file="debug_logs/$vm_name.log"
-            local retries=3
-            local output=""
-            for i in $(seq 1 $retries); do
-              echo "Attempt $i for command: $cmd" >> "$output_file"
-              output=$(bash -c "$cmd" 2>>"$output_file")
-              local exit_code=$?
-              if [[ $exit_code -eq 0 ]]; then
-                echo "$output"
-                echo "Command succeeded" >> "$output_file"
-                return 0
-              fi
-              echo "Retry $i failed with exit code $exit_code" >> "$output_file"
-              sleep $((i * 5))
-            done
-            echo "Command failed after $retries retries" >> "$output_file"
-            echo "ERROR"
-            return 1
-          }
-
           while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
             echo "Checking $VM_NAME in resource group $RESOURCE_GROUP"
             
             # Handle missing or unknown VM_STATE
             if [[ -z "$VM_STATE" || "$VM_STATE" == "Unknown" ]]; then
-              echo "!!!VM_STATE missing or unknown for $VM_NAME, querying Azure..."
-              VM_STATE=$(run_azure_cmd "az vm get-instance-view --name '$VM_NAME' --resource-group '$RESOURCE_GROUP' --query 'instanceView.statuses[?code=='PowerState/running'].code'" "$VM_NAME")
-              if [[ "$VM_STATE" == "ERROR" ]]; then
-                echo "!!!Failed to retrieve state for $VM_NAME after retries. Skipping..." | tee -a skipped_vms.log
+              echo "VM_STATE missing or unknown for $VM_NAME, querying Azure..."
+              VM_STATE=$(az vm get-instance-view \
+                --name "$VM_NAME" \
+                --resource-group "$RESOURCE_GROUP" \
+                --query 'instanceView.statuses[?code==`PowerState/running`].code' \
+                --output tsv 2>/dev/null || echo "")
+              
+              if [[ -z "$VM_STATE" ]]; then
+                echo "Failed to retrieve state for $VM_NAME. Skipping..." | tee -a skipped_vms.log
                 SKIPPED_VMS+=("$VM_NAME")
                 continue
               fi
             fi
 
+            # Check if VM is running
             if [[ "$VM_STATE" != "PowerState/running" && "$VM_STATE" != "VM running" ]]; then
-              echo "!!!VM $VM_NAME is in state: $VM_STATE. Skipping..." | tee -a skipped_vms.log
+              echo "VM $VM_NAME is in state: $VM_STATE. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
 
-            echo "VM $VM_NAME is running. Proceeding with architecture check."
-            ACTIVE_VM_NAMES+=("$VM_NAME")
-
-            # Check architecture with retries
-            CMD_OUTPUT=$(run_azure_cmd "az vm run-command invoke --name '$VM_NAME' --resource-group '$RESOURCE_GROUP' --command-id RunShellScript --scripts 'uname -m' --query 'value[0].message'" "$VM_NAME" | grep -oP '(?<=stdout\]\n).*?(?=\n\n\[stderr)')
-            if [[ "$CMD_OUTPUT" == "ERROR" ]]; then
-              echo "!!!Failed to retrieve architecture for $VM_NAME after retries. See debug_logs/$VM_NAME.log for details. Skipping..." | tee -a skipped_vms.log
+            echo "VM $VM_NAME is running. Getting architecture..."
+            
+            # Get architecture with improved error handling
+            RESULT=$(az vm run-command invoke \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --command-id RunShellScript \
+              --scripts "uname -m" \
+              --output json 2>&1)
+            
+            if [[ $? -ne 0 ]]; then
+              echo "Failed to run command on $VM_NAME: $RESULT" | tee -a "debug_logs/${VM_NAME}.log"
+              echo "Command execution failed for $VM_NAME. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
-
-            # Log raw command output for debugging
-            echo "Raw command output for $VM_NAME: $CMD_OUTPUT" >> debug_logs/$VM_NAME.log
-
-            # Validate command output format
-            if [[ "$CMD_OUTPUT" != *"[stdout]"* || "$CMD_OUTPUT" != *"[stderr]"* ]]; then
-              echo "!!!Unexpected command output format for $VM_NAME: $CMD_OUTPUT. See debug_logs/$VM_NAME.log for details. Skipping..." | tee -a skipped_vms.log
+            
+            # Log the full result for debugging
+            echo "Full command result for $VM_NAME:" >> "debug_logs/${VM_NAME}.log"
+            echo "$RESULT" >> "debug_logs/${VM_NAME}.log"
+            
+            # Extract architecture from JSON output
+            ARCH=$(echo "$RESULT" | jq -r '.value[0].message' 2>/dev/null | grep -oP '(?<=stdout\]\n)[^\n\r]*(?=\n|\r|\[stderr\])' | tr -d '\r\n' | xargs)
+            
+            if [[ -z "$ARCH" ]]; then
+              echo "Could not determine architecture for $VM_NAME" | tee -a "debug_logs/${VM_NAME}.log"
+              echo "Architecture parsing failed for $VM_NAME. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
-
-            # Extract architecture, removing newlines and extra whitespace
-            SYSTEM_ARCH=$(echo "$CMD_OUTPUT" | sed -n 's/.*\[stdout\]\s*\([[:alnum:]_-]*\)\s*\[stderr\].*/\1/p' | tr -s '[:space:]' | tr -d '\n')
-            if [[ -z "$SYSTEM_ARCH" ]]; then
-              echo "!!!Failed to parse architecture for $VM_NAME. Raw output: $CMD_OUTPUT. See debug_logs/$VM_NAME.log for details. Skipping..." | tee -a skipped_vms.log
-              SKIPPED_VMS+=("$VM_NAME")
-              continue
-            fi
-
-            # Validate architecture
-            case "$SYSTEM_ARCH" in
+            
+            echo "Detected architecture for $VM_NAME: '$ARCH'" >> "debug_logs/${VM_NAME}.log"
+            
+            # Map architecture to standard names
+            case "$ARCH" in
               x86_64) ARCH_NAME="amd64" ;;
               aarch64|arm64) ARCH_NAME="arm64" ;;
               *)
-                echo "!!!Unsupported architecture: '$SYSTEM_ARCH' on $VM_NAME. Skipping..." | tee -a skipped_vms.log
+                echo "Unsupported architecture: '$ARCH' on $VM_NAME. Skipping..." | tee -a skipped_vms.log
                 SKIPPED_VMS+=("$VM_NAME")
                 continue
                 ;;
             esac
 
             echo "VM $VM_NAME is using architecture: $ARCH_NAME"
-            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | tr '-' '_')
-            if [[ -z "$SAFE_VM_NAME" || "$SAFE_VM_NAME" =~ ^[0-9] || "$SAFE_VM_NAME" =~ [^a-zA-Z0-9_] ]]; then
-              echo "!!!Invalid SAFE_VM_NAME for $VM_NAME: $SAFE_VM_NAME. Skipping environment variable setting..." | tee -a skipped_vms.log
-              SKIPPED_VMS+=("$VM_NAME")
-              continue
+            ACTIVE_VM_NAMES+=("$VM_NAME")
+            
+            # Create safe environment variable names
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | sed 's/^[0-9]/_&/')
+            
+            if [[ -n "$SAFE_VM_NAME" ]]; then
+              echo "ARCH_$SAFE_VM_NAME=$ARCH_NAME" >> $GITHUB_ENV
+              echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
+            else
+              echo "Could not create safe environment variable name for $VM_NAME" | tee -a skipped_vms.log
             fi
-            echo "ARCH_$SAFE_VM_NAME=$ARCH_NAME" >> $GITHUB_ENV
-            echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
+            
             sleep 2  # Avoid Azure API rate limits
           done < linux_vms.tsv
 
           echo "Active VMs: ${ACTIVE_VM_NAMES[*]}"
           echo "Skipped VMs: ${SKIPPED_VMS[*]}"
           echo "SKIPPED_VMS=${SKIPPED_VMS[*]}" >> $GITHUB_ENV
+          
           if [[ ${#ACTIVE_VM_NAMES[@]} -eq 0 ]]; then
-            echo "!!!No active VMs found! Exiting with warning..." | tee -a skipped_vms.log
+            echo "No active VMs found! Exiting with warning..." | tee -a skipped_vms.log
             exit 1
           fi
 
           echo "ACTIVE_VM_NAMES=${ACTIVE_VM_NAMES[*]}" >> $GITHUB_ENV
+
+      - name: Upload Extension Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-logs
+          path: extension_logs/
 
       - name: Upload Skipped VMs Log
         if: always()
@@ -185,3 +208,25 @@ jobs:
         with:
           name: debug-logs
           path: debug_logs/
+
+      # Debug step - remove after testing
+      - name: Debug Single VM (Remove after testing)
+        if: failure()
+        run: |
+          echo "=== DEBUG: Testing single VM ==="
+          VM_NAME="test1"
+          RESOURCE_GROUP="EXAMPLE-RESOURCES"
+          
+          echo "1. Checking VM status..."
+          az vm show --name "$VM_NAME" --resource-group "$RESOURCE_GROUP" --query "powerState" --output tsv
+          
+          echo "2. Testing simple run command..."
+          az vm run-command invoke \
+            --name "$VM_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --command-id RunShellScript \
+            --scripts "echo 'Hello World' && uname -m" \
+            --output json
+          
+          echo "3. Checking extensions..."
+          az vm extension list --vm-name "$VM_NAME" --resource-group "$RESOURCE_GROUP" --output table
