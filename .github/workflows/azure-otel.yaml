@@ -38,6 +38,8 @@ jobs:
             echo "No Linux VMs found with OTEL=True tag"
             exit 0
           fi
+          echo "Contents of linux_vms.tsv:"
+          cat linux_vms.tsv
           
           VM_NAMES=$(awk '{print $1}' linux_vms.tsv | tr '\n' ' ' | sed 's/ *$//')
           echo "Found Linux VM Names: $VM_NAMES"
