@@ -129,22 +129,46 @@ jobs:
         run: |
           echo "=== VM Processing Summary ==="
           echo "Total VMs found with OTEL=True tag: $(wc -l < linux_vms.tsv)"
-          echo "Active VMs processed: ${#ACTIVE_VM_NAMES[@]}"
-          echo "Skipped VMs: ${#SKIPPED_VM_NAMES[@]}"
+          
+          # Convert space-separated strings to arrays for counting
+          IFS=' ' read -ra ACTIVE_ARRAY <<< "$ACTIVE_VM_NAMES"
+          IFS=' ' read -ra SKIPPED_ARRAY <<< "$SKIPPED_VM_NAMES"
+          
+          # Filter out empty elements
+          ACTIVE_COUNT=0
+          for vm in "${ACTIVE_ARRAY[@]}"; do
+            if [[ -n "$vm" ]]; then
+              ((ACTIVE_COUNT++))
+            fi
+          done
+          
+          SKIPPED_COUNT=0
+          for vm in "${SKIPPED_ARRAY[@]}"; do
+            if [[ -n "$vm" ]]; then
+              ((SKIPPED_COUNT++))
+            fi
+          done
+          
+          echo "Active VMs processed: $ACTIVE_COUNT"
+          echo "Skipped VMs: $SKIPPED_COUNT"
           echo ""
           echo "=== Active VMs ==="
-          if [[ ${#ACTIVE_VM_NAMES[@]} -gt 0 ]]; then
-            for vm in "${ACTIVE_VM_NAMES[@]}"; do
-              echo "  - $vm"
+          if [[ $ACTIVE_COUNT -gt 0 ]]; then
+            for vm in "${ACTIVE_ARRAY[@]}"; do
+              if [[ -n "$vm" ]]; then
+                echo "  - $vm"
+              fi
             done
           else
             echo "  No active VMs found"
           fi
           echo ""
           echo "=== Skipped VMs ==="
-          if [[ ${#SKIPPED_VM_NAMES[@]} -gt 0 ]]; then
-            for vm in "${SKIPPED_VM_NAMES[@]}"; do
-              echo "  - $vm"
+          if [[ $SKIPPED_COUNT -gt 0 ]]; then
+            for vm in "${SKIPPED_ARRAY[@]}"; do
+              if [[ -n "$vm" ]]; then
+                echo "  - $vm"
+              fi
             done
           else
             echo "  No VMs were skipped"
