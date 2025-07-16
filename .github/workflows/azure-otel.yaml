@@ -131,19 +131,20 @@ jobs:
               continue
             fi
 
-            # Extract architecture
-            SYSTEM_ARCH=$(echo "$CMD_OUTPUT" | sed -n 's/.*\[stdout\]\(.*\)\[stderr\].*/\1/p' | tr -d '\n')
+            # Extract architecture, removing newlines and extra whitespace
+            SYSTEM_ARCH=$(echo "$CMD_OUTPUT" | sed -n 's/.*\[stdout\]\s*\(.*\)\s*\[stderr\].*/\1/p' | tr -s '\n' ' ' | tr -s '[:space:]' | tr -d '\n')
             if [[ -z "$SYSTEM_ARCH" ]]; then
               echo "!!!Failed to parse architecture for $VM_NAME. Raw output: $CMD_OUTPUT. See debug_logs/$VM_NAME.log for details. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
 
+            # Validate architecture
             case "$SYSTEM_ARCH" in
               x86_64) ARCH_NAME="amd64" ;;
               aarch64|arm64) ARCH_NAME="arm64" ;;
               *)
-                echo "!!!Unsupported architecture: $SYSTEM_ARCH on $VM_NAME. Skipping..." | tee -a skipped_vms.log
+                echo "!!!Unsupported architecture: '$SYSTEM_ARCH' on $VM_NAME. Skipping..." | tee -a skipped_vms.log
                 SKIPPED_VMS+=("$VM_NAME")
                 continue
                 ;;
