@@ -9,57 +9,53 @@ jobs:
   otel-contrib-agent:
     permissions:
       id-token: write  # Required for OIDC token fetching
-      contents: read  # Required for actions/checkout
+      contents: read   # Required for actions/checkout
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.CHARAN_TOKEN }}
-
       - name: Azure CLI Login
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Get Azure Linux VMs by OTEL Tag
         id: get-linux-vms
         run: |
-          echo "Querying all running VMs with OTEL=True..."
+          echo "Querying all VMs with OTEL=True..."
           az vm list \
-          --show-details \
-          --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState}" \
-          --output tsv > linux_vms.tsv
-        
+            --show-details \
+            --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState}" \
+            --output tsv > linux_vms.tsv
+          
           if [[ ! -s linux_vms.tsv ]]; then
             echo "No Linux VMs found with OTEL=True tag"
             exit 0
           fi
+          
           echo "Contents of linux_vms.tsv:"
           cat linux_vms.tsv
           
           VM_NAMES=$(awk '{print $1}' linux_vms.tsv | tr '\n' ' ' | sed 's/ *$//')
           echo "Found Linux VM Names: $VM_NAMES"
           echo "VM_NAMES=$VM_NAMES" >> $GITHUB_ENV
-
+      - name: Upload TSV as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-vms-tsv
+          path: linux_vms.tsv
       - name: Check VMs/Architectures/Status
         run: |
           ACTIVE_VM_NAMES=()
           SKIPPED_VMS=()
 
-          while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP; do
+          while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
             echo "Checking $VM_NAME in resource group $RESOURCE_GROUP"
             
-            # Verify VM state
-            VM_STATE=$(az vm get-instance-view \
-              --name "$VM_NAME" \
-              --resource-group "$RESOURCE_GROUP" \
-              --query "instanceView.statuses[?code=='PowerState/running'].code" \
-              --output tsv 2>/dev/null || echo "ERROR")
-            
+            # Use VM_STATE from linux_vms.tsv
             if [[ "$VM_STATE" != "VM running" ]]; then
               echo "!!!VM $VM_NAME is in state: $VM_STATE. Skipping..."
               SKIPPED_VMS+=("$VM_NAME")
@@ -98,6 +94,8 @@ jobs:
             echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
           done < linux_vms.tsv
 
+          echo "Active VMs: ${ACTIVE_VM_NAMES[*]}"
+          echo "Skipped VMs: ${SKIPPED_VMS[*]}"
           echo "SKIPPED_VMS=${SKIPPED_VMS[*]}" >> $GITHUB_ENV
           if [[ ${#ACTIVE_VM_NAMES[@]} -eq 0 ]]; then
             echo "!!!No active VMs found! Exiting..."
