@@ -16,59 +16,67 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.CHARAN_TOKEN }}
+
+      - name: Validate Secrets
+        run: |
+          if [[ -z "${{ secrets.AZURE_CLIENT_ID }}" || -z "${{ secrets.AZURE_TENANT_ID }}" || -z "${{ secrets.AZURE_SUBSCRIPTION_ID }}" || -z "${{ secrets.CHARAN_TOKEN }}" ]]; then
+            echo "Error: One or more required secrets (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, CHARAN_TOKEN) are missing."
+            exit 1
+          fi
+
       - name: Azure CLI Login
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       - name: Get Azure Linux VMs by OTEL Tag
         id: get-linux-vms
         run: |
           echo "Querying all VMs with OTEL=True..."
           az vm list \
             --show-details \
-            --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState }" \
-            --output tsv > linux_vms.tsv
+            --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState}" \
+            --output tsv > linux_vms.tsv || { echo "Failed to list VMs"; exit 1; }
           
           if [[ ! -s linux_vms.tsv ]]; then
             echo "No Linux VMs found with OTEL=True tag"
+            echo "VM_NAMES=" >> $GITHUB_ENV
             exit 0
           fi
           
           echo "Contents of linux_vms.tsv:"
           cat linux_vms.tsv
           
-          # Validate TSV has at least two columns
-          while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
-            if [[ -z "$VM_NAME" || -z "$RESOURCE_GROUP" ]]; then
-              echo "!!!Invalid TSV format: Missing name or resource group in line: $VM_NAME $RESOURCE_GROUP $VM_STATE"
-              exit 1
-            fi
-            # Set default state if VM_STATE is empty
-            if [[ -z "$VM_STATE" ]]; then
-              echo "!!!Missing powerState for $VM_NAME, setting to 'Unknown'"
-              VM_STATE="Unknown"
-              echo "$VM_NAME\t$RESOURCE_GROUP\t$VM_STATE" >> temp_vms.tsv
-            else
-              echo "$VM_NAME\t$RESOURCE_GROUP\t$VM_STATE" >> temp_vms.tsv
-            fi
-          done < linux_vms.tsv
-          
-          mv temp_vms.tsv linux_vms.tsv
-          
           VM_NAMES=$(awk '{print $1}' linux_vms.tsv | tr '\n' ' ' | sed 's/ *$//')
           echo "Found Linux VM Names: $VM_NAMES"
           echo "VM_NAMES=$VM_NAMES" >> $GITHUB_ENV
+
       - name: Upload TSV as Artifact
+        if: steps.get-linux-vms.outputs.VM_NAMES != ''
         uses: actions/upload-artifact@v4
         with:
           name: linux-vms-tsv
           path: linux_vms.tsv
+
       - name: Check VMs/Architectures/Status
         run: |
           ACTIVE_VM_NAMES=()
           SKIPPED_VMS=()
+          echo "Skipped VMs:" > skipped_vms.log
+
+          run_azure_cmd() {
+            local cmd="$1"
+            local retries=3
+            for i in $(seq 1 $retries); do
+              output=$($cmd --output tsv 2>/dev/null) && echo "$output" && return 0
+              echo "Retry $i for command: $cmd"
+              sleep $((i * 5))
+            done
+            echo "ERROR"
+            return 1
+          }
 
           while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
             echo "Checking $VM_NAME in resource group $RESOURCE_GROUP"
@@ -76,20 +84,16 @@ jobs:
             # Handle missing or unknown VM_STATE
             if [[ -z "$VM_STATE" || "$VM_STATE" == "Unknown" ]]; then
               echo "!!!VM_STATE missing or unknown for $VM_NAME, querying Azure..."
-              VM_STATE=$(az vm get-instance-view \
-                --name "$VM_NAME" \
-                --resource-group "$RESOURCE_GROUP" \
-                --query "instanceView.statuses[?code=='PowerState/running'].code" \
-                --output tsv 2>/dev/null || echo "ERROR")
+              VM_STATE=$(run_azure_cmd "az vm get-instance-view --name '$VM_NAME' --resource-group '$RESOURCE_GROUP' --query 'instanceView.statuses[?code=='PowerState/running'].code'")
               if [[ "$VM_STATE" == "ERROR" ]]; then
-                echo "!!!Failed to retrieve state for $VM_NAME. Skipping..."
+                echo "!!!Failed to retrieve state for $VM_NAME after retries. Skipping..." | tee -a skipped_vms.log
                 SKIPPED_VMS+=("$VM_NAME")
                 continue
               fi
             fi
 
             if [[ "$VM_STATE" != "PowerState/running" && "$VM_STATE" != "VM running" ]]; then
-              echo "!!!VM $VM_NAME is in state: $VM_STATE. Skipping..."
+              echo "!!!VM $VM_NAME is in state: $VM_STATE. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
@@ -97,47 +101,59 @@ jobs:
             echo "VM $VM_NAME is running. Proceeding with architecture check."
             ACTIVE_VM_NAMES+=("$VM_NAME")
 
-            # Check architecture
-            CMD_OUTPUT=$(az vm run-command invoke \
-              --name "$VM_NAME" \
-              --resource-group "$RESOURCE_GROUP" \
-              --command-id RunShellScript \
-              --scripts 'uname -m' \
-              --query 'value[0].message' \
-              --output tsv 2>/dev/null || echo "ERROR")
-            
-            if [[ "$CMD_OUTPUT" == "ERROR" || -z "$CMD_OUTPUT" ]]; then
-              echo "!!!Failed to retrieve architecture for $VM_NAME. Skipping..."
+            # Check architecture with retries
+            CMD_OUTPUT=$(run_azure_cmd "az vm run-command invoke --name '$VM_NAME' --resource-group '$RESOURCE_GROUP' --command-id RunShellScript --scripts 'uname -m' --query 'value[0].message'")
+            if [[ "$CMD_OUTPUT" == "ERROR" ]]; then
+              echo "!!!Failed to retrieve architecture for $VM_NAME after retries. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
 
-            # Extract architecture from [stdout]...[stderr]
-            SYSTEM_ARCH=$(echo "$CMD_OUTPUT" | sed -n 's/.*\[stdout\]\(.*\)\[stderr\].*/\1/p' | tr -d '\n')
-            if [[ -z "$SYSTEM_ARCH" ]]; then
-              echo "!!!Failed to parse architecture for $VM_NAME. Skipping..."
+            # Validate command output format
+            if [[ "$CMD_OUTPUT" != *"[stdout]"* || "$CMD_OUTPUT" != *"[stderr]"* ]]; then
+              echo "!!!Unexpected command output format for $VM_NAME: $CMD_OUTPUT. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
+
+            # Extract architecture
+            SYSTEM_ARCH=$(echo "$CMD_OUTPUT" | sed -n 's/.*\[stdout\]\(.*\)\[stderr\].*/\1/p' | tr -d '\n')
+            if [[ -z "$SYSTEM_ARCH" ]]; then
+              echo "!!!Failed to parse architecture for $VM_NAME. Skipping..." | tee -a skipped_vms.log
+              SKIPPED_VMS+=("$VM_NAME")
+              continue
+            fi
+
             case "$SYSTEM_ARCH" in
               x86_64) ARCH_NAME="amd64" ;;
               aarch64|arm64) ARCH_NAME="arm64" ;;
-              *) echo "!!!Unsupported architecture: $SYSTEM_ARCH on $VM_NAME. Skipping..."; SKIPPED_VMS+=("$VM_NAME"); continue ;;
+              *)
+                echo "!!!Unsupported architecture: $SYSTEM_ARCH on $VM_NAME. Skipping..." | tee -a skipped_vms.log
+                SKIPPED_VMS+=("$VM_NAME")
+                continue
+                ;;
             esac
 
             echo "VM $VM_NAME is using architecture: $ARCH_NAME"
-
-            SAFE_VM_NAME=$(echo "$VM_NAME" | tr '-' '_')
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | tr '-' '_')
             echo "ARCH_$SAFE_VM_NAME=$ARCH_NAME" >> $GITHUB_ENV
             echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
+            sleep 2  # Avoid Azure API rate limits
           done < linux_vms.tsv
 
           echo "Active VMs: ${ACTIVE_VM_NAMES[*]}"
           echo "Skipped VMs: ${SKIPPED_VMS[*]}"
           echo "SKIPPED_VMS=${SKIPPED_VMS[*]}" >> $GITHUB_ENV
           if [[ ${#ACTIVE_VM_NAMES[@]} -eq 0 ]]; then
-            echo "!!!No active VMs found! Exiting..."
-            exit 0
+            echo "!!!No active VMs found! Exiting with warning..."
+            exit 1
           fi
 
           echo "ACTIVE_VM_NAMES=${ACTIVE_VM_NAMES[*]}" >> $GITHUB_ENV
+
+      - name: Upload Skipped VMs Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipped-vms-log
+          path: skipped_vms.log
