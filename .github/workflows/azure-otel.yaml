@@ -28,7 +28,7 @@ jobs:
           echo "Querying all VMs with OTEL=True..."
           az vm list \
             --show-details \
-            --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:coalesce(powerState, 'Unknown')}" \
+            --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState }" \
             --output tsv > linux_vms.tsv
           
           if [[ ! -s linux_vms.tsv ]]; then
