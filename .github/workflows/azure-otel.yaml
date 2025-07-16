@@ -52,7 +52,9 @@ jobs:
       - name: Get VM Architecture for Running VMs
         run: |
           ACTIVE_VM_NAMES=()
+          SKIPPED_VM_NAMES=()
           mkdir -p vm_architecture_logs
+          mkdir -p vm_skipped_logs
           
           while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
             echo "Processing $VM_NAME in resource group $RESOURCE_GROUP"
@@ -98,19 +100,52 @@ jobs:
                 fi
               else
                 echo "Could not determine VM size for $VM_NAME"
+                echo "VM: $VM_NAME, RG: $RESOURCE_GROUP, Reason: Could not determine VM size" >> "vm_skipped_logs/${VM_NAME}_skipped.log"
+                SKIPPED_VM_NAMES+=("$VM_NAME (size detection failed)")
               fi
             else
               echo "VM $VM_NAME is not running (state: $VM_STATE). Skipping architecture detection."
+              echo "VM: $VM_NAME, RG: $RESOURCE_GROUP, State: $VM_STATE, Reason: VM not running" >> "vm_skipped_logs/${VM_NAME}_skipped.log"
+              SKIPPED_VM_NAMES+=("$VM_NAME ($VM_STATE)")
             fi
             
             sleep 1  # Avoid Azure API rate limits
           done < linux_vms.tsv
 
           echo "Active VMs with architecture detected: ${ACTIVE_VM_NAMES[*]}"
+          echo "Skipped VMs: ${SKIPPED_VM_NAMES[*]}"
           echo "ACTIVE_VM_NAMES=${ACTIVE_VM_NAMES[*]}" >> $GITHUB_ENV
+          echo "SKIPPED_VM_NAMES=${SKIPPED_VM_NAMES[*]}" >> $GITHUB_ENV
 
-      - name: Upload VM Architecture Logs
+      - name: Upload VM Processing Logs
         uses: actions/upload-artifact@v4
         with:
-          name: vm-architecture-logs
-          path: vm_architecture_logs/
+          name: vm-processing-logs
+          path: |
+            vm_architecture_logs/
+            vm_skipped_logs/
+
+      - name: Summary Report
+        run: |
+          echo "=== VM Processing Summary ==="
+          echo "Total VMs found with OTEL=True tag: $(wc -l < linux_vms.tsv)"
+          echo "Active VMs processed: ${#ACTIVE_VM_NAMES[@]}"
+          echo "Skipped VMs: ${#SKIPPED_VM_NAMES[@]}"
+          echo ""
+          echo "=== Active VMs ==="
+          if [[ ${#ACTIVE_VM_NAMES[@]} -gt 0 ]]; then
+            for vm in "${ACTIVE_VM_NAMES[@]}"; do
+              echo "  - $vm"
+            done
+          else
+            echo "  No active VMs found"
+          fi
+          echo ""
+          echo "=== Skipped VMs ==="
+          if [[ ${#SKIPPED_VM_NAMES[@]} -gt 0 ]]; then
+            for vm in "${SKIPPED_VM_NAMES[@]}"; do
+              echo "  - $vm"
+            done
+          else
+            echo "  No VMs were skipped"
+          fi
