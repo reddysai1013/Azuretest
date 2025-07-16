@@ -28,7 +28,7 @@ jobs:
           echo "Querying all VMs with OTEL=True..."
           az vm list \
             --show-details \
-            --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState}" \
+            --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:coalesce(powerState, 'Unknown')}" \
             --output tsv > linux_vms.tsv
           
           if [[ ! -s linux_vms.tsv ]]; then
@@ -39,13 +39,23 @@ jobs:
           echo "Contents of linux_vms.tsv:"
           cat linux_vms.tsv
           
-          # Validate TSV has three columns
+          # Validate TSV has at least two columns
           while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
-            if [[ -z "$VM_NAME" || -z "$RESOURCE_GROUP" || -z "$VM_STATE" ]]; then
-              echo "!!!Invalid TSV format: Missing columns in line: $VM_NAME $RESOURCE_GROUP $VM_STATE"
+            if [[ -z "$VM_NAME" || -z "$RESOURCE_GROUP" ]]; then
+              echo "!!!Invalid TSV format: Missing name or resource group in line: $VM_NAME $RESOURCE_GROUP $VM_STATE"
               exit 1
             fi
+            # Set default state if VM_STATE is empty
+            if [[ -z "$VM_STATE" ]]; then
+              echo "!!!Missing powerState for $VM_NAME, setting to 'Unknown'"
+              VM_STATE="Unknown"
+              echo "$VM_NAME\t$RESOURCE_GROUP\t$VM_STATE" >> temp_vms.tsv
+            else
+              echo "$VM_NAME\t$RESOURCE_GROUP\t$VM_STATE" >> temp_vms.tsv
+            fi
           done < linux_vms.tsv
+          
+          mv temp_vms.tsv linux_vms.tsv
           
           VM_NAMES=$(awk '{print $1}' linux_vms.tsv | tr '\n' ' ' | sed 's/ *$//')
           echo "Found Linux VM Names: $VM_NAMES"
@@ -63,9 +73,9 @@ jobs:
           while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
             echo "Checking $VM_NAME in resource group $RESOURCE_GROUP"
             
-            # Use VM_STATE from linux_vms.tsv, fallback to Azure query if empty
-            if [[ -z "$VM_STATE" ]]; then
-              echo "!!!VM_STATE missing for $VM_NAME, querying Azure..."
+            # Handle missing or unknown VM_STATE
+            if [[ -z "$VM_STATE" || "$VM_STATE" == "Unknown" ]]; then
+              echo "!!!VM_STATE missing or unknown for $VM_NAME, querying Azure..."
               VM_STATE=$(az vm get-instance-view \
                 --name "$VM_NAME" \
                 --resource-group "$RESOURCE_GROUP" \
