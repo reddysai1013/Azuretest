@@ -19,8 +19,13 @@ jobs:
 
       - name: Validate Secrets
         run: |
-          if [[ -z "${{ secrets.AZURE_CLIENT_ID }}" || -z "${{ secrets.AZURE_TENANT_ID }}" || -z "${{ secrets.AZURE_SUBSCRIPTION_ID }}" || -z "${{ secrets.CHARAN_TOKEN }}" ]]; then
-            echo "Error: One or more required secrets (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, CHARAN_TOKEN) are missing."
+          missing_secrets=()
+          [[ -z "${{ secrets.AZURE_CLIENT_ID }}" ]] && missing_secrets+=("AZURE_CLIENT_ID")
+          [[ -z "${{ secrets.AZURE_TENANT_ID }}" ]] && missing_secrets+=("AZURE_TENANT_ID")
+          [[ -z "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]] && missing_secrets+=("AZURE_SUBSCRIPTION_ID")
+          [[ -z "${{ secrets.CHARAN_TOKEN }}" ]] && missing_secrets+=("CHARAN_TOKEN")
+          if [[ ${#missing_secrets[@]} -gt 0 ]]; then
+            echo "Error: Missing required secrets: ${missing_secrets[*]}"
             exit 1
           fi
 
@@ -34,10 +39,10 @@ jobs:
       - name: Get Azure Linux VMs by OTEL Tag
         id: get-linux-vms
         run: |
-          echo "Querying all VMs with OTEL=True..."
+          echo "Querying Linux VMs with OTEL=True..."
           az vm list \
             --show-details \
-            --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState}" \
+            --query "[?tags.OTEL == 'True' && storageProfile.osDisk.osType == 'Linux'].{name:name, resourceGroup:resourceGroup, powerState:powerState}" \
             --output tsv > linux_vms.tsv || { echo "Failed to list VMs"; exit 1; }
           
           if [[ ! -s linux_vms.tsv ]]; then
@@ -49,12 +54,16 @@ jobs:
           echo "Contents of linux_vms.tsv:"
           cat linux_vms.tsv
           
-          VM_NAMES=$(awk '{print $1}' linux_vms.tsv | tr '\n' ' ' | sed 's/ *$//')
+          VM_NAMES=$(awk -F'\t' '$1 && NF == 3 {print $1}' linux_vms.tsv | tr '\n' ' ' | sed 's/ *$//')
+          if [[ -z "$VM_NAMES" ]]; then
+            echo "Error: Failed to parse VM names from linux_vms.tsv"
+            exit 1
+          fi
           echo "Found Linux VM Names: $VM_NAMES"
           echo "VM_NAMES=$VM_NAMES" >> $GITHUB_ENV
 
       - name: Upload TSV as Artifact
-        if: steps.get-linux-vms.outputs.VM_NAMES != ''
+        if: env.VM_NAMES != ''
         uses: actions/upload-artifact@v4
         with:
           name: linux-vms-tsv
@@ -77,9 +86,9 @@ jobs:
               echo "Attempt $i for command: $cmd" >> "$output_file"
               output=$(bash -c "$cmd" 2>>"$output_file")
               local exit_code=$?
-              if [[ $exit_code -eq 0 ]]; then
+              if [[ $exit_code -eq 0 && -n "$output" ]]; then
                 echo "$output"
-                echo "Command succeeded" >> "$output_file"
+                echo "Command succeeded with output: $output" >> "$output_file"
                 return 0
               fi
               echo "Retry $i failed with exit code $exit_code" >> "$output_file"
@@ -96,7 +105,7 @@ jobs:
             # Handle missing or unknown VM_STATE
             if [[ -z "$VM_STATE" || "$VM_STATE" == "Unknown" ]]; then
               echo "!!!VM_STATE missing or unknown for $VM_NAME, querying Azure..."
-              VM_STATE=$(run_azure_cmd "az vm get-instance-view --name '$VM_NAME' --resource-group '$RESOURCE_GROUP' --query 'instanceView.statuses[?code=='PowerState/running'].code'" "$VM_NAME")
+              VM_STATE=$(run_azure_cmd "az vm get-instance-view --name '$VM_NAME' --resource-group '$RESOURCE_GROUP' --query 'instanceView.statuses[?starts_with(code, ''PowerState/'')].code' --output tsv" "$VM_NAME")
               if [[ "$VM_STATE" == "ERROR" ]]; then
                 echo "!!!Failed to retrieve state for $VM_NAME after retries. Skipping..." | tee -a skipped_vms.log
                 SKIPPED_VMS+=("$VM_NAME")
@@ -104,7 +113,7 @@ jobs:
               fi
             fi
 
-            if [[ "$VM_STATE" != "PowerState/running" && "$VM_STATE" != "VM running" ]]; then
+            if [[ "$VM_STATE" != "PowerState/running" ]]; then
               echo "!!!VM $VM_NAME is in state: $VM_STATE. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
               continue
@@ -114,7 +123,7 @@ jobs:
             ACTIVE_VM_NAMES+=("$VM_NAME")
 
             # Check architecture with retries
-            CMD_OUTPUT=$(run_azure_cmd "az vm run-command invoke --name '$VM_NAME' --resource-group '$RESOURCE_GROUP' --command-id RunShellScript --scripts 'uname -m' --query 'value[0].message'" "$VM_NAME")
+            CMD_OUTPUT=$(run_azure_cmd "az vm run-command invoke --name '$VM_NAME' --resource-group '$RESOURCE_GROUP' --command-id RunShellScript --scripts 'uname -m' --query 'value[0].message' --output json" "$VM_NAME")
             if [[ "$CMD_OUTPUT" == "ERROR" ]]; then
               echo "!!!Failed to retrieve architecture for $VM_NAME after retries. See debug_logs/$VM_NAME.log for details. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
@@ -124,15 +133,8 @@ jobs:
             # Log raw command output for debugging
             echo "Raw command output for $VM_NAME: $CMD_OUTPUT" >> debug_logs/$VM_NAME.log
 
-            # Validate command output format
-            if [[ "$CMD_OUTPUT" != *"[stdout]"* || "$CMD_OUTPUT" != *"[stderr]"* ]]; then
-              echo "!!!Unexpected command output format for $VM_NAME: $CMD_OUTPUT. See debug_logs/$VM_NAME.log for details. Skipping..." | tee -a skipped_vms.log
-              SKIPPED_VMS+=("$VM_NAME")
-              continue
-            fi
-
-            # Extract architecture, removing newlines and extra whitespace
-            SYSTEM_ARCH=$(echo "$CMD_OUTPUT" | sed -n 's/.*\[stdout\]\s*\([[:alnum:]_-]*\)\s*\[stderr\].*/\1/p' | tr -s '[:space:]' | tr -d '\n')
+            # Parse architecture using jq
+            SYSTEM_ARCH=$(echo "$CMD_OUTPUT" | jq -r '. | split("[stdout]\n")[1] | split("\n[stderr]")[0] | split("\n") | join(" ") | split(" ") | join("")')
             if [[ -z "$SYSTEM_ARCH" ]]; then
               echo "!!!Failed to parse architecture for $VM_NAME. Raw output: $CMD_OUTPUT. See debug_logs/$VM_NAME.log for details. Skipping..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
@@ -151,8 +153,8 @@ jobs:
             esac
 
             echo "VM $VM_NAME is using architecture: $ARCH_NAME"
-            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | tr '-' '_')
-            if [[ -z "$SAFE_VM_NAME" || "$SAFE_VM_NAME" =~ ^[0-9] || "$SAFE_VM_NAME" =~ [^a-zA-Z0-9_] ]]; then
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]-' '_' | sed 's/^_*/_/;s/_*$/_/')
+            if [[ -z "$SAFE_VM_NAME" || "$SAFE_VM_NAME" =~ ^[0-9] || "$SAFE_VM_NAME" =~ [^a-zA-Z0-9_-] ]]; then
               echo "!!!Invalid SAFE_VM_NAME for $VM_NAME: $SAFE_VM_NAME. Skipping environment variable setting..." | tee -a skipped_vms.log
               SKIPPED_VMS+=("$VM_NAME")
               continue
@@ -171,12 +173,12 @@ jobs:
           fi
 
           echo "ACTIVE_VM_NAMES=${ACTIVE_VM_NAMES[*]}" >> $GITHUB_ENV
-
+          
       - name: Upload Skipped VMs Log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: skipped-vms-log
+          name: skipped、とてもvms-log
           path: skipped_vms.log
 
       - name: Upload Debug Logs
