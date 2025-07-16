@@ -58,7 +58,7 @@ jobs:
               --query "instanceView.statuses[?code=='PowerState/running'].code" \
               --output tsv 2>/dev/null || echo "ERROR")
             
-            if [[ "$VM_STATE" != "PowerState/running" ]]; then
+            if [[ "$VM_STATE" != "VM running" ]]; then
               echo "!!!VM $VM_NAME is in state: $VM_STATE. Skipping..."
               SKIPPED_VMS+=("$VM_NAME")
               continue
