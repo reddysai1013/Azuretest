@@ -1,481 +1,159 @@
-name: Linux Install/Update & Configure OpenTelemetry Agent via AWS SSM (Linux Environment)
+name: Azure Install/Update & Configure OpenTelemetry Agent
 
 on:
   schedule:
     - cron: "0 0 1 * *"  # Runs at 00:00 UTC on the 1st of every month
-
   workflow_dispatch:  # Allows manual execution
-
 
 jobs:
   otel-contrib-agent:
+    permissions:
+      id-token: write  # Required for OIDC token fetching
+      contents: read   # Required for actions/checkout
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.ILLIA_GITHUB_TOKEN }}
-
-      - name: Set-up AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+          token: ${{ secrets.CHARAN_TOKEN }}
+      - name: Azure CLI Login
+        uses: azure/login@v2
         with:
-          aws-access-key-id: ${{ secrets.SHERPA_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.SHERPA_AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-      
-      - name: Get EC2 Linux Instance IDs by OTEL Tag (Multi-Region)
-        id: get-linux-instance-ids
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Get Azure Linux VMs by OTEL Tag
+        id: get-linux-vms
         run: |
-          echo "Querying all running instances with OTEL=True across U.S regions..."
-
-          US_REGIONS=("us-east-1" "us-east-2" "us-west-1" "us-west-2")
-          > linux_instances.tsv  # Clear output file
+          echo "Querying all VMs with OTEL=True..."
+          az vm list \
+            --show-details \
+            --query "[?tags.OTEL == 'True'].{name:name, resourceGroup:resourceGroup, powerState:powerState}" \
+            --output tsv > linux_vms.tsv
           
-          for REGION in "${US_REGIONS[@]}"; do
-            echo "Checking region: $REGION"
-            aws ec2 describe-instances \
-              --region "$REGION" \
-              --filters "Name=tag:OTEL,Values=True" "Name=instance-state-name,Values=running" \
-              --query "Reservations[].Instances[?Platform!='windows'].[InstanceId]" \
-              --output text | awk -v region="$REGION" '{print $1 "\t" region}' >> linux_instances.tsv
-          done
-          
-          if [[ ! -s linux_instances.tsv ]]; then
-            echo "No Linux instances found with OTEL=True tag in any U.S Region"
+          if [[ ! -s linux_vms.tsv ]]; then
+            echo "No Linux VMs found with OTEL=True tag"
             exit 0
           fi
           
-          # Extract only instance IDs (first column) from the TSV file
-          INSTANCE_IDS=$(awk '{print $1}' linux_instances.tsv | tr '\n' ' ' | sed 's/ *$//')
-          echo "Found Linux Instance IDs: $INSTANCE_IDS"
-          echo "INSTANCE_IDS=$INSTANCE_IDS" >> $GITHUB_ENV
-
-      - name: Check Instances/Architectures/Status
-        run: |
-          ACTIVE_INSTANCE_IDS=()
-          SKIPPED_INSTANCES=()
-
-          while IFS=$'\t' read -r INSTANCE_ID REGION; do
-            echo "Checking $INSTANCE_ID in region $REGION"
-            
-            # DEBUG: Mask or suppress AWS CLI authentication info
-      
-            aws sts get-caller-identity --query 'Arn' --output text > /dev/null 2>&1 || { echo "!!!AWS authentication failed!"; exit 1; }
-
-            INSTANCE_STATE=$(aws ec2 describe-instances \
-              --instance-ids "$INSTANCE_ID" \
-              --query 'Reservations[0].Instances[0].State.Name' \
-              --region "$REGION" \
-              --output text 2>&1) || {
-              echo "!!!Failed to get instance state for $INSTANCE_ID: $INSTANCE_STATE"
-              SKIPPED_INSTANCES+=("$INSTANCE_ID")
-              continue
-            }
-
-            if [[ -z "$INSTANCE_STATE" || "$INSTANCE_STATE" == "null" ]]; then
-              echo "!!!Unable to retrieve state for $INSTANCE_ID. Skipping..."
-              SKIPPED_INSTANCES+=("$INSTANCE_ID")
-              continue
-            fi
-
-            if [[ "$INSTANCE_STATE" != "running" ]]; then
-              echo "!!!Instance $INSTANCE_ID is in state: $INSTANCE_STATE. Skipping..."
-              SKIPPED_INSTANCES+=("$INSTANCE_ID")
-              continue
-            fi
-
-            echo "Instance $INSTANCE_ID is running. Proceeding with architecture check."
-            ACTIVE_INSTANCE_IDS+=("$INSTANCE_ID")
-
-            echo "Querying architecture for $INSTANCE_ID..."
-
-            CMD_ID=$(aws ssm send-command \
-              --document-name "AWS-RunShellScript" \
-              --instance-ids "$INSTANCE_ID" \
-              --parameters commands='uname -m' \
-              --region "$REGION" \
-              --query "Command.CommandId" --output text 2>&1) || {
-              echo "!!!Failed to send command to $INSTANCE_ID: $CMD_ID"
-              continue
-            }
-
-            if [[ -z "$CMD_ID" || "$CMD_ID" == "null" ]]; then
-              echo "!!Invalid command ID for $INSTANCE_ID. Skipping..."
-              continue
-            fi
-
-            sleep 5
-            SYSTEM_ARCH=$(aws ssm get-command-invocation \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query 'StandardOutputContent' \
-              --region "$REGION" \
-              --output text 2>&1) || {
-              echo "!!!Failed to retrieve architecture for $INSTANCE_ID: $SYSTEM_ARCH"
-              continue
-            }
-
-            if [[ -z "$SYSTEM_ARCH" ]]; then
-              echo "!!!Architecture response empty for $INSTANCE_ID. Skipping..."
-              continue
-            fi
-
-            case "$SYSTEM_ARCH" in
-              x86_64) ARCH_NAME="amd64" ;;
-              aarch64|arm64) ARCH_NAME="arm64" ;;
-              *) echo "!!!Unsupported architecture: $SYSTEM_ARCH on $INSTANCE_ID. Skipping..."; continue ;;
-            esac
-
-            echo "Instance $INSTANCE_ID is using architecture: $ARCH_NAME"
-
-            SAFE_INSTANCE_ID=$(echo "$INSTANCE_ID" | tr '-' '_')
-
-            echo "ARCH_$SAFE_INSTANCE_ID=$ARCH_NAME" >> $GITHUB_ENV
-            # Also save instance-region mapping for later
-            echo "REGION_$SAFE_INSTANCE_ID=$REGION" >> $GITHUB_ENV
-          done < linux_instances.tsv
-
-          echo "SKIPPED_INSTANCES=${SKIPPED_INSTANCES[*]}" >> $GITHUB_ENV
-          if [[ ${#ACTIVE_INSTANCE_IDS[@]} -eq 0 ]]; then
-            echo "!!!No active instances found! Exiting..."
-            exit 0
-          fi
-
-          echo "ACTIVE_INSTANCE_IDS=${ACTIVE_INSTANCE_IDS[*]}" >> $GITHUB_ENV
-
-      - name: Copy Missing Config Files and Commit - Linux
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-         
-          CHANGES_MADE=false
-         
-          for INSTANCE_ID in $INSTANCE_IDS; do
-            CONFIG_FILE="agents/otel/config/Linux/$INSTANCE_ID.yaml"
-        
-            # If the config file is missing, copy the default config and commit it
-            if [[ ! -f "$CONFIG_FILE" ]]; then
-              echo "Config file for $INSTANCE_ID not found. Copying default..."
-              cp agents/otel/config/aws-otel-agent-coralogix-sherpa.yaml "$CONFIG_FILE"
-              git add "$CONFIG_FILE"
-              CHANGES_MADE=true
-            fi
-          done
-
-          # Commit and push if new config files were copied
-          if [[ "$CHANGES_MADE" == true ]]; then
-            git commit -m "Copy default config files for instances [ci skip]"
-            git push origin main
-          else
-            echo "No new config files copied, no push needed."
-          fi
-
-        env:
-          GITHUB_TOKEN: ${{ secrets.ILLIA_GITHUB_TOKEN }}
-
-      - name: Inject Private API Key into Config Files
-        run: |
-          for INSTANCE_ID in $INSTANCE_IDS; do
-            CONFIG_FILE="agents/otel/config/Linux/$INSTANCE_ID.yaml"
-            # Replace Private API key in the config file (if needed)
-            if [[ -f "$CONFIG_FILE" ]]; then
-              sed -i "s/private_key: \"REPLACE_ME\"/private_key: \"${SHERPA_PRIVATE_KEY}\"/" "$CONFIG_FILE"
-              git add "$CONFIG_FILE"
-            fi
-          done
-
-        env:
-          SHERPA_PRIVATE_KEY: ${{ secrets.SHERPA_PRIVATE_KEY }}
-          GITHUB_TOKEN: ${{ secrets.ILLIA_GITHUB_TOKEN }}
-
-      - name: Install or Update OpenTelemetry Agent per Instance
-        run: |
-          INSTALLED_INSTANCES=()
-          UPDATED_INSTANCES=()
-          INSTALLED_VERSIONS=()
+          echo "Contents of linux_vms.tsv:"
+          cat linux_vms.tsv
           
-          for INSTANCE_ID in $ACTIVE_INSTANCE_IDS; do
-            echo "Checking OpenTelemetry installation on instance: $INSTANCE_ID"
-           
-            # Fetch latest OpenTelemetry version
-            LATEST_VERSION=$(curl -s https://api.github.com/repos/open-telemetry/opentelemetry-collector-releases/releases/latest | jq -r '.tag_name' | sed 's/v//')
-            echo "Latest OpenTelemetry Collector version: $LATEST_VERSION"
+          VM_NAMES=$(awk '{print $1}' linux_vms.tsv | tr '\n' ' ' | sed 's/ *$//')
+          echo "Found Linux VM Names: $VM_NAMES"
+          echo "VM_NAMES=$VM_NAMES" >> $GITHUB_ENV
 
-            SAFE_INSTANCE_ID=$(echo "$INSTANCE_ID" | tr '-' '_')
-            REGION_VAR="REGION_$SAFE_INSTANCE_ID"
-            REGION=${!REGION_VAR}
-            
-            if [[ -z "$REGION" ]]; then
-              echo "REGION not set for $INSTANCE_ID (env var $REGION_VAR missing)"
-              continue
-            fi
+      - name: Upload TSV as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-vms-tsv
+          path: linux_vms.tsv
 
-            echo "Using region: $REGION"
- 
-            # Check if OpenTelemetry is installed
-            CHECK_VERSION_CMD_ID=$(aws ssm send-command \
-              --document-name "AWS-RunShellScript" \
-              --region "$REGION" \
-              --instance-ids "$INSTANCE_ID" \
-              --parameters commands='["if command -v /usr/local/bin/otelcol-agent; then /usr/local/bin/otelcol-agent --version | awk '\''{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+/) print $i}'\'' | grep -oE '\''[0-9]+(\.[0-9]+)*'\''; else echo NOT_INSTALLED; fi"]' \
-              --query "Command.CommandId" --output text)
-  
-            if [[ -z "$CHECK_VERSION_CMD_ID" || "$CHECK_VERSION_CMD_ID" == "null" ]]; then
-              echo "!!!Failed to send version check command to $INSTANCE_ID. Skipping..."
-              continue
-            fi
-   
-            sleep 5
-   
-            # Get installed version
-            INSTALLED_VERSION=$(aws ssm get-command-invocation \
-              --command-id "$CHECK_VERSION_CMD_ID" \
-              --region "$REGION" \
-              --instance-id "$INSTANCE_ID" \
-              --query 'StandardOutputContent' \
-              --output text | grep -oE '[0-9]+(\.[0-9]+)*' || echo "NOT_INSTALLED")
-   
-            if [[ "$INSTALLED_VERSION" == "NOT_INSTALLED" ]]; then
-              echo "!!! OpenTelemetry Agent is NOT installed on $INSTANCE_ID. Proceeding with installation..."
-              INSTALLED_INSTANCES+=("$INSTANCE_ID")
-            elif [[ "$INSTALLED_VERSION" != "$LATEST_VERSION" ]]; then
-              echo "Upgrading OpenTelemetry Agent on $INSTANCE_ID (from $INSTALLED_VERSION to $LATEST_VERSION)..."
-              UPDATED_INSTANCES+=("$INSTANCE_ID")
-            else
-              echo "OpenTelemetry Agent is already up-to-date ($LATEST_VERSION) on $INSTANCE_ID. Skipping update."
-              INSTALLED_VERSIONS+=("$INSTANCE_ID:$INSTALLED_VERSION")
-              continue
-            fi
-   
-            # Read architecture from stored environment variables
-            SAFE_INSTANCE_ID=$(echo "$INSTANCE_ID" | tr '-' '_')
-            ARCH_VAR="ARCH_$SAFE_INSTANCE_ID"
-            ARCH=${!ARCH_VAR}
-   
-            echo "Using architecture: $ARCH"
-   
-            # Construct OTEL download URL
-            OTEL_URL="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${LATEST_VERSION}/otelcol-contrib_${LATEST_VERSION}_linux_${ARCH}.tar.gz"
-            
-            # Check if config files exist before installing
-            CONFIG_FILE="agents/otel/config/Linux/$INSTANCE_ID.yaml"
-            if [[ ! -f "$CONFIG_FILE" ]]; then
-              echo "!!!Config file for $INSTANCE_ID not found! Skipping..."
-              continue
-            fi
-            CONFIG_CONTENT=$(base64 -w 0 < "$CONFIG_FILE")
-   
-            SERVICE_FILE="agents/otel/config/Linux/otelcol-agent.service.yaml"
-            if [[ ! -f "$SERVICE_FILE" ]]; then
-              echo "!!!Service file not found! Skipping..."
-              continue
-            fi
-   
-            SERVICE_CONTENT=$(base64 -w 0 < "$SERVICE_FILE")
-    
-            # Install OpenTelemetry
-            COMMAND_ID=$(aws ssm send-command \
-              --region "$REGION" \
-              --timeout-seconds 900 \
-              --instance-ids "$INSTANCE_ID" \
-              --document-name "AWS-RunShellScript" \
-              --parameters commands='[
-                "wget -O /tmp/otelcol.tar.gz '"$OTEL_URL"'",
-                "tar -xvf /tmp/otelcol.tar.gz -C /tmp",
-                "mv -f /tmp/otelcol-contrib /usr/local/bin/otelcol-agent",
-                "sudo chown root:root /usr/local/bin/otelcol-agent",
-                "chmod +x /usr/local/bin/otelcol-agent",
-                "echo '"$CONFIG_CONTENT"' | base64 --decode | sudo tee /etc/otel-agent-config.yaml > /dev/null",
-                "echo '"$SERVICE_CONTENT"' | base64 --decode | sudo tee /etc/systemd/system/otelcol-agent.service > /dev/null",
-                "sudo systemctl daemon-reload",
-                "sudo systemctl enable otelcol-agent",
-                "sudo systemctl restart otelcol-agent",
-                "sleep 5",
-                "if [[ $(systemctl is-active otelcol-agent) == '\''active'\'' ]]; then echo OpenTelemetry Agent is running successfully!; else echo ❌ OpenTelemetry Agent failed to start. Showing logs:; sudo journalctl -u otelcol-agent --no-pager --lines=50; exit 1; fi"
-              ]' \
-              --output json | jq -r .Command.CommandId)
-     
-            echo "SSM Command ID for $INSTANCE_ID: $COMMAND_ID"
-   
-            # Store installed versions
-            INSTALLED_VERSIONS+=("$INSTANCE_ID:$LATEST_VERSION")
-          done
-   
-          echo "INSTALLED_VERSIONS=${INSTALLED_VERSIONS[*]}" >> $GITHUB_ENV
-          echo "UPDATED_INSTANCES=${UPDATED_INSTANCES[*]}" >> $GITHUB_ENV
-          echo "INSTALLED_INSTANCES=${INSTALLED_INSTANCES[*]}" >> $GITHUB_ENV
-
-      - name: Check and Update Configuration Files if Needed
+      - name: Check VMs/Architectures/Status
         run: |
-          UPDATED_CONFIG_INSTANCES=()
-          FAILED_RESTART_INSTANCES=()
-    
-          for INSTANCE_ID in $ACTIVE_INSTANCE_IDS; do
-            echo "Checking configuration updates for $INSTANCE_ID..."
+          ACTIVE_VM_NAMES=()
+          SKIPPED_VMS=()
+          mkdir -p vm_architecture_logs
+          
+          while IFS=
 
-            SAFE_INSTANCE_ID=$(echo "$INSTANCE_ID" | tr '-' '_')
-            REGION_VAR="REGION_$SAFE_INSTANCE_ID"
-            REGION=${!REGION_VAR}
-
-            if [[ -z "$REGION" ]]; then
-              echo "REGION not set for $INSTANCE_ID (env var $REGION_VAR missing)"
-              continue
-            fi
-
-            echo "Using region: $REGION"
-   
-            CONFIG_FILE="agents/otel/config/Linux/$INSTANCE_ID.yaml"
-            DEFAULT_CONFIG_FILE="agents/otel/config/aws-otel-agent-sherpa.yaml"
-            if [[ ! -f "$CONFIG_FILE" ]]; then
-              if [[ -f "$DEFAULT_CONFIG_FILE" ]]; then
-                echo "Config file for $INSTANCE_ID not found. Copying default config..."
-                cp "$DEFAULT_CONFIG_FILE" "$CONFIG_FILE"
-              else
-                echo "!!!Default config file not found! Skipping $INSTANCE_ID..."
+      - name: Upload VM Architecture Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-architecture-logs
+          path: vm_architecture_logs/\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
+            echo "Checking $VM_NAME in resource group $RESOURCE_GROUP"
+            
+            # DEBUG: Validate Azure authentication
+            az account show --query 'name' --output text > /dev/null 2>&1 || { echo "!!!Azure authentication failed!"; exit 1; }
+            
+            # Get current VM state if not available or unknown
+            if [[ -z "$VM_STATE" || "$VM_STATE" == "Unknown" ]]; then
+              echo "VM_STATE missing or unknown for $VM_NAME, querying Azure..."
+              VM_STATE=$(az vm get-instance-view \
+                --name "$VM_NAME" \
+                --resource-group "$RESOURCE_GROUP" \
+                --query 'instanceView.statuses[?code==`PowerState/running`].displayStatus' \
+                --output tsv 2>&1) || {
+                echo "!!!Failed to get VM state for $VM_NAME: $VM_STATE"
+                SKIPPED_VMS+=("$VM_NAME")
                 continue
-              fi
+              }
             fi
-    
-            # Get the current config checksum on the server
-            CHECKSUM_CMD_ID=$(aws ssm send-command \
-              --region "$REGION" \
-              --document-name "AWS-RunShellScript" \
-              --instance-ids "$INSTANCE_ID" \
-              --parameters commands='[ 
-                "if [ -f /etc/otel-agent-config.yaml ]; then md5sum /etc/otel-agent-config.yaml | awk '\''{print $1}'\''; else echo MISSING_FILE; fi"
-              ]' \
-              --output json | jq -r .Command.CommandId)
-    
-            sleep 5  # Allow time for execution
-    
-            SERVER_CHECKSUM=$(aws ssm get-command-invocation \
-              --command-id "$CHECKSUM_CMD_ID" \
-              --region "$REGION" \
-              --instance-id "$INSTANCE_ID" \
-              --query 'StandardOutputContent' \
-              --output text | awk '{print $1}')
-     
-            # Compute the local config file checksum
-            LOCAL_CHECKSUM=$(md5sum "$CONFIG_FILE" | awk '{print $1}')
-     
-            echo "Server Config Hash: $SERVER_CHECKSUM"
-            echo "Local Config Hash: $LOCAL_CHECKSUM"
-    
-            # If hashes match, skip update
-            if [[ "$SERVER_CHECKSUM" == "$LOCAL_CHECKSUM" ]]; then
-              echo "Config is already up-to-date on $INSTANCE_ID. Skipping update."
+            
+            if [[ -z "$VM_STATE" || "$VM_STATE" == "null" ]]; then
+              echo "!!!Unable to retrieve state for $VM_NAME. Skipping..."
+              SKIPPED_VMS+=("$VM_NAME")
               continue
             fi
-     
-            echo "Config has changed! Updating on $INSTANCE_ID..."
-            UPDATED_CONFIG_INSTANCES+=("$INSTANCE_ID")
-     
-            # Encode file content
-            CONFIG_CONTENT=$(base64 -w 0 < "$CONFIG_FILE")
-    
-            # Send SSM command to update config and restart agent
-            COMMAND_ID=$(aws ssm send-command \
-              --region "$REGION" \
-              --timeout-seconds 900 \
-              --instance-ids "$INSTANCE_ID" \
-              --document-name "AWS-RunShellScript" \
-              --parameters commands='[ 
-                "echo '"$CONFIG_CONTENT"' | base64 --decode | sudo tee /etc/otel-agent-config.yaml > /dev/null",
-                "echo Restarting OpenTelemetry Service...",
-                "sudo systemctl daemon-reload",
-                "sudo systemctl restart otelcol-agent",
-                "sleep 5",
-                "if [[ $(systemctl is-active otelcol-agent) == '\''active'\'' ]]; then echo OpenTelemetry Agent restarted successfully!; else echo ❌ OpenTelemetry Agent failed to restart. Showing logs:; sudo journalctl -u otelcol-agent --no-pager --lines=50; exit 1; fi"
-              ]' \
-              --output json | jq -r .Command.CommandId)
-     
-            echo "SSM Command ID for update on $INSTANCE_ID: $COMMAND_ID"
-      
-            # Verify if the agent restarted successfully
-            sleep 5  # Allow time for restart check
-     
-            AGENT_STATUS_CMD_ID=$(aws ssm send-command \
-              --document-name "AWS-RunShellScript" \
-              --region "$REGION" \
-              --instance-ids "$INSTANCE_ID" \
-              --parameters commands='systemctl is-active otelcol-agent' \
-              --query "Command.CommandId" --output text)
-     
-            sleep 5  # Allow time for execution
-    
-            AGENT_STATUS=$(aws ssm get-command-invocation \
-              --command-id "$AGENT_STATUS_CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$REGION" \
-              --query 'StandardOutputContent' \
-              --output text | tr -d '[:space:]')
-     
-            if [[ "$AGENT_STATUS" == "active" ]]; then
-              echo "OpenTelemetry Agent is running successfully after restart on $INSTANCE_ID."
-            else
-              echo "!!!OpenTelemetry Agent failed to restart on $INSTANCE_ID!"
-              FAILED_RESTART_INSTANCES+=("$INSTANCE_ID")
+            
+            if [[ "$VM_STATE" != "PowerState/running" && "$VM_STATE" != "VM running" ]]; then
+              echo "!!!VM $VM_NAME is in state: $VM_STATE. Skipping..."
+              SKIPPED_VMS+=("$VM_NAME")
+              continue
             fi
-          done
-     
-          echo "UPDATED_CONFIG_INSTANCES=${UPDATED_CONFIG_INSTANCES[*]}" >> $GITHUB_ENV
-          echo "FAILED_RESTART_INSTANCES=${FAILED_RESTART_INSTANCES[*]}" >> $GITHUB_ENV
-
-      - name: Final Summary
-        run: |
-          echo "OpenTelemetry Installation & Configuration Summary"
-          echo "---------------------------------------------"
-    
-          ACTIVE_INSTANCES="${ACTIVE_INSTANCE_IDS:-}"
-          SKIPPED_INSTANCES="${SKIPPED_INSTANCES:-}"
-          UPDATED_CONFIG_INSTANCES="${UPDATED_CONFIG_INSTANCES:-}"
-          FAILED_RESTART_INSTANCES="${FAILED_RESTART_INSTANCES:-}"
-          INSTALLED_VERSIONS="${INSTALLED_VERSIONS:-}"
-          UPDATED_INSTANCES="${UPDATED_INSTANCES:-}"
-          INSTALLED_INSTANCES="${INSTALLED_INSTANCES:-}"
-      
-          echo "Active Instances Processed:"
-          if [[ -n "$INSTALLED_VERSIONS" ]]; then
-            for entry in $INSTALLED_VERSIONS; do
-              INSTANCE=$(echo $entry | cut -d: -f1)
-              VERSION=$(echo $entry | cut -d: -f2)
-              echo -e "\e[1;32m   - $INSTANCE running OpenTelemetry Agent version: $VERSION.\e[0m"
-            done
-          else
-            echo -e "\e[1;31m   - No active instances detected.\e[0m"
+            
+            echo "VM $VM_NAME is running. Proceeding with architecture check."
+            ACTIVE_VM_NAMES+=("$VM_NAME")
+            
+            echo "Querying architecture for $VM_NAME..."
+            
+            # Get VM size to determine architecture
+            VM_SIZE=$(az vm show \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --query 'hardwareProfile.vmSize' \
+              --output text 2>&1) || {
+              echo "!!!Failed to get VM size for $VM_NAME: $VM_SIZE"
+              SKIPPED_VMS+=("$VM_NAME")
+              continue
+            }
+            
+            if [[ -z "$VM_SIZE" || "$VM_SIZE" == "null" ]]; then
+              echo "!!!VM size response empty for $VM_NAME. Skipping..."
+              SKIPPED_VMS+=("$VM_NAME")
+              continue
+            fi
+            
+            # Map VM size to architecture
+            case "$VM_SIZE" in
+              *_A*|*_D*|*_E*|*_F*|*_G*|*_H*|*_L*|*_M*|*_N*|*_S*|Standard_B*|Standard_DC*|Standard_NC*|Standard_ND*|Standard_NP*|Standard_NV*)
+                ARCH_NAME="amd64"
+                ;;
+              *ps_*|*pbs_*|*pd_*|*pm_*|*Dpls_*|*Epls_*|*Epsv*)
+                ARCH_NAME="arm64"
+                ;;
+              *)
+                echo "!!!Unsupported VM size: $VM_SIZE on $VM_NAME. Skipping..."
+                SKIPPED_VMS+=("$VM_NAME")
+                continue
+                ;;
+            esac
+            
+            echo "VM $VM_NAME is using architecture: $ARCH_NAME"
+            echo "VM: $VM_NAME, RG: $RESOURCE_GROUP, Size: $VM_SIZE, Architecture: $ARCH_NAME" >> "vm_architecture_logs/${VM_NAME}.log"
+            
+            # Create safe environment variable names
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | sed 's/^[0-9]/_&/')
+            
+            if [[ -n "$SAFE_VM_NAME" ]]; then
+              echo "ARCH_$SAFE_VM_NAME=$ARCH_NAME" >> $GITHUB_ENV
+              echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
+            fi
+            
+            sleep 1  # Avoid Azure API rate limits
+          done < linux_vms.tsv
+          
+          echo "SKIPPED_VMS=${SKIPPED_VMS[*]}" >> $GITHUB_ENV
+          if [[ ${#ACTIVE_VM_NAMES[@]} -eq 0 ]]; then
+            echo "!!!No active VMs found! Exiting..."
             exit 0
           fi
-      
-          if [[ -n "$UPDATED_INSTANCES" ]]; then
-            echo -e "\e[1;33mInstances Updated: $UPDATED_INSTANCES.\e[0m"
-          else
-            echo -e "\e[1;34mNo instances required an update.\e[0m"
-          fi
-     
-          if [[ -n "$INSTALLED_INSTANCES" ]]; then
-            echo -e "\e[1;33mNewly Installed Instances: $INSTALLED_INSTANCES\e[0m"
-          else
-            echo -e "\e[1;34mNo new installations were required.\e[0m"
-          fi
-    
-          if [[ -n "$UPDATED_CONFIG_INSTANCES" ]]; then
-            echo -e "\e[1;33mConfigurations Updated on: $UPDATED_CONFIG_INSTANCES\e[0m"
-          else
-            echo -e "\e[1;34mNo configuration updates were needed.\e[0m"
-          fi
-      
-          if [[ -z "$UPDATED_CONFIG_INSTANCES" ]]; then
-            echo -e "\e[1;34mNo config changes detected. No restart needed.\e[0m"
-          elif [[ -n "$FAILED_RESTART_INSTANCES" ]]; then
-            echo -e "\e[1;31mOpenTelemetry Agent FAILED to restart on: $FAILED_RESTART_INSTANCES\e[0m"
-          else
-            echo -e "\e[1;32mAll agents restarted successfully after config update.\e[0m"
-          fi
-     
-          if [[ -n "$SKIPPED_INSTANCES" ]]; then
-            echo -e "\e[1;33mInstances Skipped: $SKIPPED_INSTANCES\e[0m"
-          fi
-     
-          echo "---------------------------------------------"
-          echo -e "\e[1;32mOpenTelemetry setup completed successfully!\e[0m"
+          
+          echo "ACTIVE_VM_NAMES=${ACTIVE_VM_NAMES[*]}" >> $GITHUB_ENV
+
+      - name: Upload VM Architecture Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-architecture-logs
+          path: vm_architecture_logs/
