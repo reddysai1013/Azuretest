@@ -64,81 +64,65 @@ jobs:
           echo "Found Linux VM IDs: $VM_IDS"
           echo "VM_IDS=$VM_IDS" >> $GITHUB_ENV
 
-      - name: Check VMs Status and Architecture
+      - name: Get VM Architecture for Running VMs
         run: |
-          ACTIVE_VM_IDS=()
-          SKIPPED_VMS=()
-
-          while IFS=$'\t' read -r VM_ID VM_NAME RESOURCE_GROUP LOCATION SUBSCRIPTION; do
-            echo "Checking $VM_NAME ($VM_ID) in resource group $RESOURCE_GROUP"
+          ACTIVE_VM_NAMES=()
+          mkdir -p vm_architecture_logs
+          
+          while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP VM_STATE; do
+            echo "Processing $VM_NAME in resource group $RESOURCE_GROUP"
             
-            # Set subscription context
-            az account set --subscription "$SUBSCRIPTION"
-
-            # Check VM power state
-            POWER_STATE=$(az vm get-instance-view \
-              --ids "$VM_ID" \
-              --query "instanceView.statuses[?code=='PowerState/*'].displayStatus" \
-              -o tsv 2>&1) || {
-              echo "!!!Failed to get power state for $VM_NAME: $POWER_STATE"
-              SKIPPED_VMS+=("$VM_NAME")
-              continue
-            }
-
-            if [[ "$POWER_STATE" != "VM running" ]]; then
-              echo "!!!VM $VM_NAME is not running (state: $POWER_STATE). Skipping..."
-              SKIPPED_VMS+=("$VM_NAME")
-              continue
+            # Check if VM is running
+            if [[ "$VM_STATE" == "PowerState/running" || "$VM_STATE" == "VM running" ]]; then
+              echo "VM $VM_NAME is running. Getting architecture..."
+              
+              # Get VM size to determine architecture
+              VM_SIZE=$(az vm show \
+                --name "$VM_NAME" \
+                --resource-group "$RESOURCE_GROUP" \
+                --query 'hardwareProfile.vmSize' \
+                --output tsv 2>/dev/null)
+              
+              if [[ -n "$VM_SIZE" ]]; then
+                echo "VM Size: $VM_SIZE" >> "vm_architecture_logs/${VM_NAME}.log"
+                
+                # Map VM size to architecture
+                case "$VM_SIZE" in
+                  *_A*|*_D*|*_E*|*_F*|*_G*|*_H*|*_L*|*_M*|*_N*|*_S*|Standard_B*|Standard_DC*|Standard_NC*|Standard_ND*|Standard_NP*|Standard_NV*)
+                    ARCH_NAME="amd64"
+                    ;;
+                  *ps_*|*pbs_*|*pd_*|*pm_*|*Dpls_*|*Epls_*|*Epsv*)
+                    ARCH_NAME="arm64"
+                    ;;
+                  *)
+                    echo "Unknown VM size pattern: $VM_SIZE, defaulting to amd64" >> "vm_architecture_logs/${VM_NAME}.log"
+                    ARCH_NAME="amd64"
+                    ;;
+                esac
+                
+                echo "VM $VM_NAME architecture: $ARCH_NAME"
+                echo "VM: $VM_NAME, RG: $RESOURCE_GROUP, Architecture: $ARCH_NAME" >> "vm_architecture_logs/${VM_NAME}.log"
+                ACTIVE_VM_NAMES+=("$VM_NAME")
+                
+                # Create safe environment variable names
+                SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | sed 's/^[0-9]/_&/')
+                
+                if [[ -n "$SAFE_VM_NAME" ]]; then
+                  echo "ARCH_$SAFE_VM_NAME=$ARCH_NAME" >> $GITHUB_ENV
+                  echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
+                fi
+              else
+                echo "Could not determine VM size for $VM_NAME"
+              fi
+            else
+              echo "VM $VM_NAME is not running (state: $VM_STATE). Skipping architecture detection."
             fi
-
-            echo "VM $VM_NAME is running. Checking architecture..."
-            ACTIVE_VM_IDS+=("$VM_ID")
-
-            # Get VM architecture using run command
-            ARCH_RESULT=$(az vm run-command invoke \
-              --ids "$VM_ID" \
-              --command-id RunShellScript \
-              --scripts "uname -m" \
-              --query "value[0].message" \
-              -o tsv 2>&1) || {
-              echo "!!!Failed to get architecture for $VM_NAME: $ARCH_RESULT"
-              continue
-            }
-
-            # Extract architecture from result
-            SYSTEM_ARCH=$(echo "$ARCH_RESULT" | grep -oE '(x86_64|aarch64|arm64)' | head -1)
-
-            if [[ -z "$SYSTEM_ARCH" ]]; then
-              echo "!!!Could not determine architecture for $VM_NAME. Skipping..."
-              continue
-            fi
-
-            case "$SYSTEM_ARCH" in
-              x86_64) ARCH_NAME="amd64" ;;
-              aarch64|arm64) ARCH_NAME="arm64" ;;
-              *) echo "!!!Unsupported architecture: $SYSTEM_ARCH on $VM_NAME. Skipping..."; continue ;;
-            esac
-
-            echo "VM $VM_NAME is using architecture: $ARCH_NAME"
-
-            # Create safe variable names
-            SAFE_VM_ID=$(echo "$VM_ID" | sed 's/[^a-zA-Z0-9_]/_/g')
             
-            echo "ARCH_$SAFE_VM_ID=$ARCH_NAME" >> $GITHUB_ENV
-            echo "NAME_$SAFE_VM_ID=$VM_NAME" >> $GITHUB_ENV
-            echo "RG_$SAFE_VM_ID=$RESOURCE_GROUP" >> $GITHUB_ENV
-            echo "LOC_$SAFE_VM_ID=$LOCATION" >> $GITHUB_ENV
-            echo "SUB_$SAFE_VM_ID=$SUBSCRIPTION" >> $GITHUB_ENV
-
+            sleep 1  # Avoid Azure API rate limits
           done < linux_vms.tsv
 
-          echo "SKIPPED_VMS=${SKIPPED_VMS[*]}" >> $GITHUB_ENV
-          if [[ ${#ACTIVE_VM_IDS[@]} -eq 0 ]]; then
-            echo "!!!No active VMs found! Exiting..."
-            exit 0
-          fi
-
-          echo "ACTIVE_VM_IDS=${ACTIVE_VM_IDS[*]}" >> $GITHUB_ENV
+          echo "Active VMs with architecture detected: ${ACTIVE_VM_NAMES[*]}"
+          echo "ACTIVE_VM_NAMES=${ACTIVE_VM_NAMES[*]}" >> $GITHUB_ENV
 
       - name: Copy Missing Config Files and Commit - Linux
         run: |
