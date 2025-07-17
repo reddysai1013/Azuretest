@@ -49,114 +49,115 @@ jobs:
           name: linux-vms-tsv
           path: linux_vms.tsv
 
-      - name: Check VMs/Architectures/Status
+- name: Check VMs/Architectures/Status
+  run: |
+    ACTIVE_VM_NAMES=()
+    SKIPPED_VMS=()
+
+    while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP; do
+      echo "Checking $VM_NAME in resource group $RESOURCE_GROUP"
+      
+      # Check Azure CLI authentication
+      az account show --query 'user.name' --output tsv > /dev/null 2>&1 || { echo "!!!Azure authentication failed!"; exit 1; }
+
+      # Get VM state
+      VM_STATE=$(az vm show \
+        --name "$VM_NAME" \
+        --resource-group "$RESOURCE_GROUP" \
+        --query 'instanceView.statuses[?code==`PowerState/running`].code' \
+        --output tsv 2>&1) || {
+        echo "!!!Failed to get VM state for $VM_NAME: $VM_STATE"
+        SKIPPED_VMS+=("$VM_NAME")
+        continue
+      }
+
+      if [[ -z "$VM_STATE" || "$VM_STATE" == "null" ]]; then
+        echo "!!!Unable to retrieve state for $VM_NAME. Skipping..."
+        SKIPPED_VMS+=("$VM_NAME")
+        continue
+      fi
+
+      if [[ "$VM_STATE" != "PowerState/running" ]]; then
+        echo "!!!VM $VM_NAME is not running. Skipping..."
+        SKIPPED_VMS+=("$VM_NAME")
+        continue
+      fi
+
+      echo "VM $VM_NAME is running. Proceeding with architecture check."
+      ACTIVE_VM_NAMES+=("$VM_NAME")
+
+      echo "Querying architecture for $VM_NAME..."
+
+      # Option 1: Using Azure Run Command (similar to AWS SSM)
+      COMMAND_RESULT=$(az vm run-command invoke \
+        --name "$VM_NAME" \
+        --resource-group "$RESOURCE_GROUP" \
+        --command-id RunShellScript \
+        --scripts 'uname -m' \
+        --query 'value[0].message' \
+        --output tsv 2>&1) || {
+        echo "!!!Failed to send command to $VM_NAME: $COMMAND_RESULT"
+        
+        # Fallback: Get architecture from VM size
+        echo "Falling back to VM size detection..."
+        VM_SIZE=$(az vm show \
+          --name "$VM_NAME" \
+          --resource-group "$RESOURCE_GROUP" \
+          --query 'hardwareProfile.vmSize' \
+          --output tsv 2>/dev/null)
+        
+        if [[ -n "$VM_SIZE" ]]; then
+          case "$VM_SIZE" in
+            *_A*|*_D*|*_E*|*_F*|*_G*|*_H*|*_L*|*_M*|*_N*|*_S*|Standard_B*|Standard_DC*|Standard_NC*|Standard_ND*|Standard_NP*|Standard_NV*)
+              SYSTEM_ARCH="x86_64"
+              ;;
+            *ps_*|*pbs_*|*pd_*|*pm_*|*Dpls_*|*Epls_*|*Epsv*)
+              SYSTEM_ARCH="aarch64"
+              ;;
+            *)
+              echo "!!!Unknown VM size pattern: $VM_SIZE. Skipping..."
+              continue
+              ;;
+          esac
+        else
+          echo "!!!Could not determine architecture for $VM_NAME. Skipping..."
+          continue
+        fi
+      }
+
+      # Extract architecture from command result or use fallback
+      if [[ -n "$COMMAND_RESULT" && "$COMMAND_RESULT" != "null" ]]; then
+        SYSTEM_ARCH=$(echo "$COMMAND_RESULT" | grep -o 'x86_64\|aarch64\|arm64' | head -1)
+      fi
+
+      if [[ -z "$SYSTEM_ARCH" ]]; then
+        echo "!!!Architecture response empty for $VM_NAME. Skipping..."
+        continue
+      fi
+
+      case "$SYSTEM_ARCH" in
+        x86_64) ARCH_NAME="amd64" ;;
+        aarch64|arm64) ARCH_NAME="arm64" ;;
+        *) echo "!!!Unsupported architecture: $SYSTEM_ARCH on $VM_NAME. Skipping..."; continue ;;
+      esac
+
+      echo "VM $VM_NAME is using architecture: $ARCH_NAME"
+
+      SAFE_VM_NAME=$(echo "$VM_NAME" | tr '-' '_')
+
+      echo "ARCH_$SAFE_VM_NAME=$ARCH_NAME" >> $GITHUB_ENV
+      # Also save resource group mapping for later
+      echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
+    done < linux_vms.tsv
+
+    echo "SKIPPED_VMS=${SKIPPED_VMS[*]}" >> $GITHUB_ENV
+    if [[ ${#ACTIVE_VM_NAMES[@]} -eq 0 ]]; then
+      echo "!!!No active VMs found! Exiting..."
+      exit 0
+    fi
+
+    echo "ACTIVE_VM_NAMES=${ACTIVE_VM_NAMES[*]}" >> $GITHUB_ENV
         run: |
-          ACTIVE_VM_NAMES=()
-          SKIPPED_VMS=()
-
-          while IFS=$'\t' read -r VM_NAME RESOURCE_GROUP; do
-            echo "Checking $VM_NAME in resource group $RESOURCE_GROUP"
-            
-            # Check Azure CLI authentication
-            az account show --query 'user.name' --output tsv > /dev/null 2>&1 || { echo "!!!Azure authentication failed!"; exit 1; }
-
-            # Get VM state
-            VM_STATE=$(az vm show \
-              --name "$VM_NAME" \
-              --resource-group "$RESOURCE_GROUP" \
-              --query 'instanceView.statuses[?code==`PowerState/running`].code' \
-              --output tsv 2>&1) || {
-              echo "!!!Failed to get VM state for $VM_NAME: $VM_STATE"
-              SKIPPED_VMS+=("$VM_NAME")
-              continue
-            }
-
-            if [[ -z "$VM_STATE" || "$VM_STATE" == "null" ]]; then
-              echo "!!!Unable to retrieve state for $VM_NAME. Skipping..."
-              SKIPPED_VMS+=("$VM_NAME")
-              continue
-            fi
-
-            if [[ "$VM_STATE" != "PowerState/running" ]]; then
-              echo "!!!VM $VM_NAME is not running. Skipping..."
-              SKIPPED_VMS+=("$VM_NAME")
-              continue
-            fi
-
-            echo "VM $VM_NAME is running. Proceeding with architecture check."
-            ACTIVE_VM_NAMES+=("$VM_NAME")
-
-            echo "Querying architecture for $VM_NAME..."
-
-            # Option 1: Using Azure Run Command (similar to AWS SSM)
-            COMMAND_RESULT=$(az vm run-command invoke \
-              --name "$VM_NAME" \
-              --resource-group "$RESOURCE_GROUP" \
-              --command-id RunShellScript \
-              --scripts 'uname -m' \
-              --query 'value[0].message' \
-              --output tsv 2>&1) || {
-              echo "!!!Failed to send command to $VM_NAME: $COMMAND_RESULT"
-              
-              # Fallback: Get architecture from VM size
-              echo "Falling back to VM size detection..."
-              VM_SIZE=$(az vm show \
-                --name "$VM_NAME" \
-                --resource-group "$RESOURCE_GROUP" \
-                --query 'hardwareProfile.vmSize' \
-                --output tsv 2>/dev/null)
-              
-              if [[ -n "$VM_SIZE" ]]; then
-                case "$VM_SIZE" in
-                  *_A*|*_D*|*_E*|*_F*|*_G*|*_H*|*_L*|*_M*|*_N*|*_S*|Standard_B*|Standard_DC*|Standard_NC*|Standard_ND*|Standard_NP*|Standard_NV*)
-                    SYSTEM_ARCH="x86_64"
-                    ;;
-                  *ps_*|*pbs_*|*pd_*|*pm_*|*Dpls_*|*Epls_*|*Epsv*)
-                    SYSTEM_ARCH="aarch64"
-                    ;;
-                  *)
-                    echo "!!!Unknown VM size pattern: $VM_SIZE. Skipping..."
-                    continue
-                    ;;
-                esac
-              else
-                echo "!!!Could not determine architecture for $VM_NAME. Skipping..."
-                continue
-              fi
-            }
-
-            # Extract architecture from command result or use fallback
-            if [[ -n "$COMMAND_RESULT" && "$COMMAND_RESULT" != "null" ]]; then
-              SYSTEM_ARCH=$(echo "$COMMAND_RESULT" | grep -o 'x86_64\|aarch64\|arm64' | head -1)
-            fi
-
-            if [[ -z "$SYSTEM_ARCH" ]]; then
-              echo "!!!Architecture response empty for $VM_NAME. Skipping..."
-              continue
-            fi
-
-            case "$SYSTEM_ARCH" in
-              x86_64) ARCH_NAME="amd64" ;;
-              aarch64|arm64) ARCH_NAME="arm64" ;;
-              *) echo "!!!Unsupported architecture: $SYSTEM_ARCH on $VM_NAME. Skipping..."; continue ;;
-            esac
-
-            echo "VM $VM_NAME is using architecture: $ARCH_NAME"
-
-            SAFE_VM_NAME=$(echo "$VM_NAME" | tr '-' '_')
-
-            echo "ARCH_$SAFE_VM_NAME=$ARCH_NAME" >> $GITHUB_ENV
-            # Also save resource group mapping for later
-            echo "RG_$SAFE_VM_NAME=$RESOURCE_GROUP" >> $GITHUB_ENV
-          done < linux_vms.tsv
-
-          echo "SKIPPED_VMS=${SKIPPED_VMS[*]}" >> $GITHUB_ENV
-          if [[ ${#ACTIVE_VM_NAMES[@]} -eq 0 ]]; then
-            echo "!!!No active VMs found! Exiting..."
-            exit 0
-          fi
-
-          echo "ACTIVE_VM_NAMES=${ACTIVE_VM_NAMES[*]}" >> $GITHUB_ENV
           echo "=== VM Processing Summary ==="
           echo "Total VMs found with OTEL=True tag: $(wc -l < linux_vms.tsv)"
           
@@ -168,8 +169,8 @@ jobs:
           fi
           
           # Handle skipped VMs
-          if [[ -n "$SKIPPED_VMS" && "$SKIPPED_VMS" != " " ]]; then
-            SKIPPED_COUNT=$(echo "$SKIPPED_VMS" | wc -w)
+          if [[ -n "$SKIPPED_VM_NAMES" && "$SKIPPED_VM_NAMES" != " " ]]; then
+            SKIPPED_COUNT=$(echo "$SKIPPED_VM_NAMES" | wc -w)
           else
             SKIPPED_COUNT=0
           fi
@@ -190,7 +191,7 @@ jobs:
           echo ""
           echo "=== Skipped VMs ==="
           if [[ $SKIPPED_COUNT -gt 0 ]]; then
-            echo "$SKIPPED_VMS" | tr ' ' '\n' | while read -r vm; do
+            echo "$SKIPPED_VM_NAMES" | tr ' ' '\n' | while read -r vm; do
               if [[ -n "$vm" ]]; then
                 echo "  - $vm"
               fi
