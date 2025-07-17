@@ -231,6 +231,128 @@ jobs:
           UPDATED_VM_NAMES=()
           INSTALLED_VERSIONS=()
           
+          # Fetch latest OpenTelemetry version
+          LATEST_VERSION=$(curl -s https://api.github.com/repos/open-telemetry/opentelemetry-collector-releases/releases/latest | jq -r '.tag_name' | sed 's/v//')
+          echo "Latest OpenTelemetry Collector version: $LATEST_VERSION"
+
+          for VM_NAME in $ACTIVE_VM_NAMES; do
+            echo "Processing OpenTelemetry installation check for $VM_NAME"
+            
+            # Get the safe VM name and resource group from environment variables
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | sed 's/^[0-9]/_&/')
+            RESOURCE_GROUP_VAR="RG_$SAFE_VM_NAME"
+            RESOURCE_GROUP="${!RESOURCE_GROUP_VAR}"
+            ARCH_VAR="ARCH_$SAFE_VM_NAME"
+            ARCH="${!ARCH_VAR}"
+            
+            if [[ -z "$RESOURCE_GROUP" ]]; then
+              echo "!!!Resource group not found for $VM_NAME. Skipping..."
+              continue
+            fi
+            
+            if [[ -z "$ARCH" ]]; then
+              echo "!!!Architecture not found for $VM_NAME. Skipping..."
+              continue
+            fi
+            
+            echo "Checking OpenTelemetry installation status on $VM_NAME in resource group $RESOURCE_GROUP with architecture $ARCH"
+            
+            # Check if OpenTelemetry is installed using Azure VM Run Command
+            CHECK_VERSION_RESULT=$(az vm run-command invoke \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --command-id RunShellScript \
+              --scripts 'if command -v /usr/local/bin/otelcol-agent; then /usr/local/bin/otelcol-agent --version | awk '\''{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+/) print $i}'\'' | grep -oE '\''[0-9]+(\.[0-9]+)*'\''; else echo NOT_INSTALLED; fi' \
+              --query 'value[0].message' \
+              --output tsv 2>&1)
+            
+            if [[ $? -ne 0 ]]; then
+              echo "!!!Failed to send version check command to $VM_NAME: $CHECK_VERSION_RESULT"
+              continue
+            fi
+            
+            if [[ -z "$CHECK_VERSION_RESULT" || "$CHECK_VERSION_RESULT" == "null" ]]; then
+              echo "!!!Empty response from version check command for $VM_NAME. Skipping..."
+              continue
+            fi Janssens
+            
+            # Extract version or installation status from the result
+            CURRENT_VERSION=$(echo "$CHECK_VERSION_RESULT" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1)
+            
+            if [[ "$CHECK_VERSION_RESULT" == *"NOT_INSTALLED"* || -z "$CURRENT_VERSION" ]]; then
+              echo "!!! OpenTelemetry Agent is NOT installed on $VM_NAME. Proceeding with installation..."
+              INSTALLED_VM_NAMES+=("$VM_NAME")
+            elif [[ "$CURRENT_VERSION" != "$LATEST_VERSION" ]]; then
+              echo "Upgrading OpenTelemetry Agent on $VM_NAME (from $CURRENT_VERSION to $LATEST_VERSION)..."
+              UPDATED_VM_NAMES+=("$VM_NAME")
+            else
+              echo "OpenTelemetry Agent is already up-to-date ($LATEST_VERSION) on $VM_NAME. Skipping update."
+              INSTALLED_VERSIONS+=("$VM_NAME:$CURRENT_VERSION")
+              continue
+            fi
+            
+            # Construct OTEL download URL
+            OTEL_URL="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${LATEST_VERSION}/otelcol-contrib_${LATEST_VERSION}_linux_${ARCH}.tar.gz"
+            
+            # Check if config files exist before installing
+            CONFIG_FILE="agents/otel/config/Linux/$VM_NAME.yaml"
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+              echo "!!!Config file for $VM_NAME not found! Skipping..."
+              continue
+            fi
+            CONFIG_CONTENT=$(base64 -w 0 < "$CONFIG_FILE")
+            
+            SERVICE_FILE="agents/otel/config/Linux/otelcol-agent.service.yaml"
+            if [[ ! -f "$SERVICE_FILE" ]]; then
+              echo "!!!Service file not found! Skipping..."
+              continue
+            fi
+            
+            SERVICE_CONTENT=$(base64 -w 0 < "$SERVICE_FILE")
+            
+            # Install or update OpenTelemetry
+            INSTALL_RESULT=$(az vm run-command invoke \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --command-id RunShellScript \
+              --scripts "
+                wget -O /tmp/otelcol.tar.gz \"$OTEL_URL\" && \
+                tar -xvf /tmp/otelcol.tar.gz -C /tmp && \
+                mv -f /tmp/otelcol-contrib /usr/local/bin/otelcol-agent && \
+                sudo chown root:root /usr/local/bin/otelcol-agent && \
+                chmod +x /usr/local/bin/otelcol-agent && \
+                echo \"$CONFIG_CONTENT\" | base64 --decode | sudo tee /etc/otel-agent-config.yaml > /dev/null && \
+                echo \"$SERVICE_CONTENT\" | base64 --decode | sudo tee /etc/systemd/system/otelcol-agent.service > /dev/null && \
+                sudo systemctl daemon-reload && \
+                sudo systemctl enable otelcol-agent && \
+                sudo systemctl restart otelcol-agent && \
+                sleep 5 && \
+                if [[ \$(systemctl is-active otelcol-agent) == 'active' ]]; then echo 'OpenTelemetry Agent is running successfully!'; else echo '❌ OpenTelemetry Agent failed to start. Showing logs:'; sudo journalctl -u otelcol-agent --no-pager --lines=50; exit 1; fi
+              " \
+              --query 'value[0].message' \
+              --output tsv 2>&1)
+            
+            if [[ $? -ne 0 ]]; then
+              echo "!!!Failed to install/update OpenTelemetry on $VM_NAME: $INSTALL_RESULT"
+              continue
+            fi
+            
+            echo "OpenTelemetry installation/update result for $VM_NAME: $INSTALL_RESULT"
+            INSTALLED_VERSIONS+=("$VM_NAME:$LATEST_VERSION")
+            
+            sleep 2  # Avoid Azure API rate limits
+          done
+          
+          echo "VMs requiring OpenTelemetry installation: ${INSTALLED_VM_NAMES[*]}"
+          echo "VMs with existing OpenTelemetry updated: ${UPDATED_VM_NAMES[*]}"
+          echo "INSTALLED_VM_NAMES=${INSTALLED_VM_NAMES[*]}" >> $GITHUB_ENV
+          echo "UPDATED_VM_NAMES=${UPDATED_VM_NAMES[*]}" >> $GITHUB_ENV
+          echo "INSTALLED_VERSIONS=${INSTALLED_VERSIONS[*]}" >> $GITHUB_ENV
+        run: |
+          INSTALLED_VM_NAMES=()
+          UPDATED_VM_NAMES=()
+          INSTALLED_VERSIONS=()
+          
           for VM_NAME in $ACTIVE_VM_NAMES; do
             echo "Processing OpenTelemetry installation check for $VM_NAME"
             
