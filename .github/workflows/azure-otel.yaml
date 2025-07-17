@@ -198,3 +198,19 @@ jobs:
 
         env:
           GITHUB_TOKEN: ${{ secrets.CHARAN_TOKEN }}
+
+
+      - name: Inject Private API Key into Config Files
+        run: |
+          for INSTANCE_ID in $ACTIVE_VM_NAMES; do
+            CONFIG_FILE="agents/otel/config/Linux/$INSTANCE_ID.yaml"
+            # Replace Private API key in the config file (if needed)
+            if [[ -f "$CONFIG_FILE" ]]; then
+              sed -i "s/private_key: \"REPLACE_ME\"/private_key: \"${SHERPA_PRIVATE_KEY}\"/" "$CONFIG_FILE"
+              git add "$CONFIG_FILE"
+            fi
+          done
+
+        env:
+          SHERPA_PRIVATE_KEY: ${{ secrets.SHERPA_PRIVATE_KEY }}
+          GITHUB_TOKEN: ${{ secrets.CHARAN_TOKEN }}
