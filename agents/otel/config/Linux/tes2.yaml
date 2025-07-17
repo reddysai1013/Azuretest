@@ -31,7 +31,7 @@ receivers:
 exporters:
   coralogix:
     domain: "cx498.coralogix.com"
-    private_key: "REPLACE_ME"
+    private_key: "keysforinstallation234567890"
     subsystem_name: "otel"
     application_name: "sherpa"
 
