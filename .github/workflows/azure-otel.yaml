@@ -274,7 +274,7 @@ jobs:
             if [[ -z "$CHECK_VERSION_RESULT" || "$CHECK_VERSION_RESULT" == "null" ]]; then
               echo "!!!Empty response from version check command for $VM_NAME. Skipping..."
               continue
-            fi Janssens
+            fi
             
             # Extract version or installation status from the result
             CURRENT_VERSION=$(echo "$CHECK_VERSION_RESULT" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1)
@@ -345,66 +345,6 @@ jobs:
           
           echo "VMs requiring OpenTelemetry installation: ${INSTALLED_VM_NAMES[*]}"
           echo "VMs with existing OpenTelemetry updated: ${UPDATED_VM_NAMES[*]}"
-          echo "INSTALLED_VM_NAMES=${INSTALLED_VM_NAMES[*]}" >> $GITHUB_ENV
-          echo "UPDATED_VM_NAMES=${UPDATED_VM_NAMES[*]}" >> $GITHUB_ENV
-          echo "INSTALLED_VERSIONS=${INSTALLED_VERSIONS[*]}" >> $GITHUB_ENV
-        run: |
-          INSTALLED_VM_NAMES=()
-          UPDATED_VM_NAMES=()
-          INSTALLED_VERSIONS=()
-          
-          for VM_NAME in $ACTIVE_VM_NAMES; do
-            echo "Processing OpenTelemetry installation check for $VM_NAME"
-            
-            # Get the safe VM name and resource group from environment variables
-            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | sed 's/^[0-9]/_&/')
-            RESOURCE_GROUP_VAR="RG_$SAFE_VM_NAME"
-            RESOURCE_GROUP="${!RESOURCE_GROUP_VAR}"
-            
-            if [[ -z "$RESOURCE_GROUP" ]]; then
-              echo "!!!Resource group not found for $VM_NAME. Skipping..."
-              continue
-            fi
-            
-            echo "Checking OpenTelemetry installation status on $VM_NAME in resource group $RESOURCE_GROUP"
-            
-            # Check if OpenTelemetry is installed using Azure VM Run Command
-            CHECK_VERSION_RESULT=$(az vm run-command invoke \
-              --name "$VM_NAME" \
-              --resource-group "$RESOURCE_GROUP" \
-              --command-id RunShellScript \
-              --scripts 'if command -v /usr/local/bin/otelcol-agent; then /usr/local/bin/otelcol-agent --version | awk '\''{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+/) print $i}'\'' | grep -oE '\''[0-9]+(\.[0-9]+)*'\''; else echo NOT_INSTALLED; fi' \
-              --query 'value[0].message' \
-              --output tsv 2>&1)
-            
-            if [[ $? -ne 0 ]]; then
-              echo "!!!Failed to send version check command to $VM_NAME: $CHECK_VERSION_RESULT"
-              continue
-            fi
-            
-            if [[ -z "$CHECK_VERSION_RESULT" || "$CHECK_VERSION_RESULT" == "null" ]]; then
-              echo "!!!Empty response from version check command for $VM_NAME. Skipping..."
-              continue
-            fi
-            
-            # Extract version or installation status from the result
-            CURRENT_VERSION=$(echo "$CHECK_VERSION_RESULT" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1)
-            
-            if [[ "$CHECK_VERSION_RESULT" == *"NOT_INSTALLED"* || -z "$CURRENT_VERSION" ]]; then
-              echo "OpenTelemetry is not installed on $VM_NAME"
-              INSTALLED_VM_NAMES+=("$VM_NAME")
-              INSTALLED_VERSIONS+=("NOT_INSTALLED")
-            else
-              echo "OpenTelemetry version $CURRENT_VERSION is installed on $VM_NAME"
-              UPDATED_VM_NAMES+=("$VM_NAME")
-              INSTALLED_VERSIONS+=("$CURRENT_VERSION")
-            fi
-            
-            sleep 2  # Avoid Azure API rate limits
-          done
-          
-          echo "VMs requiring OpenTelemetry installation: ${INSTALLED_VM_NAMES[*]}"
-          echo "VMs with existing OpenTelemetry (potential updates): ${UPDATED_VM_NAMES[*]}"
           echo "INSTALLED_VM_NAMES=${INSTALLED_VM_NAMES[*]}" >> $GITHUB_ENV
           echo "UPDATED_VM_NAMES=${UPDATED_VM_NAMES[*]}" >> $GITHUB_ENV
           echo "INSTALLED_VERSIONS=${INSTALLED_VERSIONS[*]}" >> $GITHUB_ENV
