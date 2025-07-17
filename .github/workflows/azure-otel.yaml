@@ -176,12 +176,12 @@ jobs:
          
           CHANGES_MADE=false
          
-          for INSTANCE_ID in $ACTIVE_VM_NAMES; do
-            CONFIG_FILE="agents/otel/config/Linux/$INSTANCE_ID.yaml"
+          for VM_NAME in $ACTIVE_VM_NAMES; do
+            CONFIG_FILE="agents/otel/config/Linux/$VM_NAME.yaml"
         
             # If the config file is missing, copy the default config and commit it
             if [[ ! -f "$CONFIG_FILE" ]]; then
-              echo "Config file for $INSTANCE_ID not found. Copying default..."
+              echo "Config file for $VM_NAME not found. Copying default..."
               cp agents/otel/config/aws-otel-agent-coralogix-sherpa.yaml "$CONFIG_FILE"
               git add "$CONFIG_FILE"
               CHANGES_MADE=true
@@ -195,22 +195,94 @@ jobs:
           else
             echo "No new config files copied, no push needed."
           fi
-
         env:
           GITHUB_TOKEN: ${{ secrets.CHARAN_TOKEN }}
-
 
       - name: Inject Private API Key into Config Files
         run: |
-          for INSTANCE_ID in $ACTIVE_VM_NAMES; do
-            CONFIG_FILE="agents/otel/config/Linux/$INSTANCE_ID.yaml"
+          CHANGES_MADE=false
+          for VM_NAME in $ACTIVE_VM_NAMES; do
+            CONFIG_FILE="agents/otel/config/Linux/$VM_NAME.yaml"
             # Replace Private API key in the config file (if needed)
             if [[ -f "$CONFIG_FILE" ]]; then
               sed -i "s/private_key: \"REPLACE_ME\"/private_key: \"${SHERPA_PRIVATE_KEY}\"/" "$CONFIG_FILE"
-              git add "$CONFIG_FILE"
+              if git diff --exit-code "$CONFIG_FILE" > /dev/null; then
+                echo "No changes made to $CONFIG_FILE"
+              else
+                git add "$CONFIG_FILE"
+                CHANGES_MADE=true
+              fi
             fi
           done
 
+          if [[ "$CHANGES_MADE" == true ]]; then
+            git commit -m "Update private API key in config files [ci skip]"
+            git push origin main
+          else
+            echo "No config files updated with API key, no push needed."
+          fi
         env:
           SHERPA_PRIVATE_KEY: ${{ secrets.SHERPA_PRIVATE_KEY }}
           GITHUB_TOKEN: ${{ secrets.CHARAN_TOKEN }}
+
+      - name: Install or Update OpenTelemetry Agent per Instance
+        run: |
+          INSTALLED_VM_NAMES=()
+          UPDATED_VM_NAMES=()
+          INSTALLED_VERSIONS=()
+          
+          for VM_NAME in $ACTIVE_VM_NAMES; do
+            echo "Processing OpenTelemetry installation check for $VM_NAME"
+            
+            # Get the safe VM name and resource group from environment variables
+            SAFE_VM_NAME=$(echo "$VM_NAME" | tr -C '[:alnum:]' '_' | sed 's/^[0-9]/_&/')
+            RESOURCE_GROUP_VAR="RG_$SAFE_VM_NAME"
+            RESOURCE_GROUP="${!RESOURCE_GROUP_VAR}"
+            
+            if [[ -z "$RESOURCE_GROUP" ]]; then
+              echo "!!!Resource group not found for $VM_NAME. Skipping..."
+              continue
+            fi
+            
+            echo "Checking OpenTelemetry installation status on $VM_NAME in resource group $RESOURCE_GROUP"
+            
+            # Check if OpenTelemetry is installed using Azure VM Run Command
+            CHECK_VERSION_RESULT=$(az vm run-command invoke \
+              --name "$VM_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --command-id RunShellScript \
+              --scripts 'if command -v /usr/local/bin/otelcol-agent; then /usr/local/bin/otelcol-agent --version | awk '\''{for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+/) print $i}'\'' | grep -oE '\''[0-9]+(\.[0-9]+)*'\''; else echo NOT_INSTALLED; fi' \
+              --query 'value[0].message' \
+              --output tsv 2>&1)
+            
+            if [[ $? -ne 0 ]]; then
+              echo "!!!Failed to send version check command to $VM_NAME: $CHECK_VERSION_RESULT"
+              continue
+            fi
+            
+            if [[ -z "$CHECK_VERSION_RESULT" || "$CHECK_VERSION_RESULT" == "null" ]]; then
+              echo "!!!Empty response from version check command for $VM_NAME. Skipping..."
+              continue
+            fi
+            
+            # Extract version or installation status from the result
+            CURRENT_VERSION=$(echo "$CHECK_VERSION_RESULT" | grep -oE '[0-9]+(\.[0-9]+)*' | head -1)
+            
+            if [[ "$CHECK_VERSION_RESULT" == *"NOT_INSTALLED"* || -z "$CURRENT_VERSION" ]]; then
+              echo "OpenTelemetry is not installed on $VM_NAME"
+              INSTALLED_VM_NAMES+=("$VM_NAME")
+              INSTALLED_VERSIONS+=("NOT_INSTALLED")
+            else
+              echo "OpenTelemetry version $CURRENT_VERSION is installed on $VM_NAME"
+              UPDATED_VM_NAMES+=("$VM_NAME")
+              INSTALLED_VERSIONS+=("$CURRENT_VERSION")
+            fi
+            
+            sleep 2  # Avoid Azure API rate limits
+          done
+          
+          echo "VMs requiring OpenTelemetry installation: ${INSTALLED_VM_NAMES[*]}"
+          echo "VMs with existing OpenTelemetry (potential updates): ${UPDATED_VM_NAMES[*]}"
+          echo "INSTALLED_VM_NAMES=${INSTALLED_VM_NAMES[*]}" >> $GITHUB_ENV
+          echo "UPDATED_VM_NAMES=${UPDATED_VM_NAMES[*]}" >> $GITHUB_ENV
+          echo "INSTALLED_VERSIONS=${INSTALLED_VERSIONS[*]}" >> $GITHUB_ENV
