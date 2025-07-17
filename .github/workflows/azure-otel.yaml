@@ -168,3 +168,33 @@ jobs:
           else
             echo "  No VMs were skipped"
           fi
+
+      - name: Copy Missing Config Files and Commit - Linux
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+         
+          CHANGES_MADE=false
+         
+          for INSTANCE_ID in $ACTIVE_VM_NAMES; do
+            CONFIG_FILE="agents/otel/config/Linux/$INSTANCE_ID.yaml"
+        
+            # If the config file is missing, copy the default config and commit it
+            if [[ ! -f "$CONFIG_FILE" ]]; then
+              echo "Config file for $INSTANCE_ID not found. Copying default..."
+              cp agents/otel/config/aws-otel-agent-coralogix-sherpa.yaml "$CONFIG_FILE"
+              git add "$CONFIG_FILE"
+              CHANGES_MADE=true
+            fi
+          done
+
+          # Commit and push if new config files were copied
+          if [[ "$CHANGES_MADE" == true ]]; then
+            git commit -m "Copy default config files for instances [ci skip]"
+            git push origin main
+          else
+            echo "No new config files copied, no push needed."
+          fi
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.CHARAN_TOKEN }}
